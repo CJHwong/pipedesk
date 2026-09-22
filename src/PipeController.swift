@@ -2,7 +2,7 @@ import Foundation
 import Security
 
 final class PipeController {
-    let profile: PipeProfile
+    var profile: PipeProfile
     private var process: Process?
     private var retired: [Process] = []
     private var generation = UUID()

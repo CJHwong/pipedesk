@@ -65,8 +65,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Log.write("app launched")
         trapSignals()
         observePowerEvents()
-        loadConfigAndStart(restartingAgents: true)
         loadPipes()
+        loadConfigAndStart(restartingAgents: true)
         if rows.isEmpty && pipes.isEmpty { showSetup() }
         // The forward becomes usable a few seconds after ssh starts, so poll
         // rather than trust the process handle alone.
@@ -99,7 +99,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if restartingAgents { restartAgents(from: config) }
         buildMenu()
-        rows.forEach { $0.controller.start() }
+        startTunnelsWhenPipesReady()
+    }
+
+    // A tunnel that rides on a pipe cannot reach anything until that pipe
+    // listens, and the pipe needs a few seconds to bind. Starting both at once
+    // spends the first attempt of every tunnel on a refused port and puts it on
+    // the backoff ladder, which now costs a minute rather than a rung. Wait for
+    // the pipes to report ready instead. The deadline keeps a pipe that never
+    // comes up from holding the tunnels hostage: they start anyway and fail the
+    // way they always did.
+    private func startTunnelsWhenPipesReady(deadline: Date? = nil) {
+        let limit = deadline ?? Date().addingTimeInterval(30)
+        let pending = pipes.contains { $0.wantsConnection && !$0.ready }
+        guard pending, Date() < limit else {
+            if pending { Log.write("pipes not ready in time, starting tunnels anyway") }
+            rows.forEach { $0.controller.start() }
+            return
+        }
+        let timer = Timer(timeInterval: 0.5, repeats: false) { [weak self] _ in
+            self?.startTunnelsWhenPipesReady(deadline: limit)
+        }
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     // MARK: Lifecycle
@@ -349,6 +370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             pipes.forEach { $0.stop() }
             pipes = profiles.map(makePipe)
             buildMenu()
+            pipes.filter { $0.profile.autoStarts }.forEach { $0.start() }
         } catch { showError(error) }
     }
 
@@ -391,6 +413,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             toggle.representedObject = pipe.profile.id
             toggle.target = self
             submenu.addItem(toggle)
+            let atLaunch = NSMenuItem(title: "Start at Launch", action: #selector(togglePipeAtLaunch(_:)),
+                                      keyEquivalent: "")
+            atLaunch.tag = 105
+            atLaunch.representedObject = pipe.profile.id
+            atLaunch.target = self
+            submenu.addItem(atLaunch)
             let copy = NSMenuItem(title: pipe.profile.mode == .share ? "Copy Ticket" : "Copy Local Address",
                                   action: #selector(copyPipe(_:)), keyEquivalent: "")
             copy.tag = 103
@@ -421,6 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.submenu?.item(withTag: 104)?.isHidden = pipe.lastError == nil
             item.submenu?.item(withTag: 102)?.title = pipe.wantsConnection ? "Stop" : "Start"
             item.submenu?.item(withTag: 103)?.isEnabled = pipe.profile.mode == .connect || pipe.ticket != nil
+            item.submenu?.item(withTag: 105)?.state = pipe.profile.autoStarts ? .on : .off
         }
     }
 
@@ -432,6 +461,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func togglePipe(_ sender: NSMenuItem) {
         guard let pipe = selectedPipe(sender) else { return }
         if pipe.wantsConnection { pipe.stop() } else { pipe.start() }
+    }
+
+    @objc private func togglePipeAtLaunch(_ sender: NSMenuItem) {
+        guard let pipe = selectedPipe(sender) else { return }
+        let wanted = !pipe.profile.autoStarts
+        pipe.profile.startsAutomatically = wanted
+        do { try ProfileStore.standard.save(pipes.map(\.profile)) }
+        catch {
+            pipe.profile.startsAutomatically = !wanted
+            showError(error)
+            return
+        }
+        refresh()
     }
 
     @objc private func copyPipe(_ sender: NSMenuItem) {

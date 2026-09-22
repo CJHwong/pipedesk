@@ -97,10 +97,13 @@ The menu bar symbol has a gap when pipes are inactive or only partly ready.
 The symbol joins when all configured pipes are ready.
 
 Start and stop each profile from its submenu. Copy tickets and local addresses from the same submenu.
-New Dumbpipe profiles remain stopped until you start them. Reloading profiles also stops them.
+New Dumbpipe profiles remain stopped until you start them.
+Choose **Start at Launch** in a profile's submenu to start that pipe whenever the app opens.
+Reloading profiles stops every pipe, then starts the ones set to start at launch.
 Automatic reconnection retries failed processes with a delay from five seconds to one minute.
 Sleep stops active processes. Wake restarts the profiles that were active before sleep.
-**Open at Login** starts the app. It does not start saved Dumbpipe shares automatically.
+**Open at Login** starts the app. Pair it with **Start at Launch** to restore a pipe after a restart.
+A tunnel from `ssh.json` waits for the pipes to listen before its first attempt, for up to 30 seconds.
 
 ## PipeDesk configuration
 

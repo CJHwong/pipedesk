@@ -33,4 +33,28 @@ check(try store.load().count == 2, "Failed save preserves profiles")
 let permissions = try FileManager.default.attributesOfItem(atPath: store.path.path)[.posixPermissions] as! NSNumber
 check(permissions.intValue == 0o600, "Profiles must be private")
 check(shellQuote("a'b") == "'a'\\''b'", "Shell quoting")
+
+// A profile written before Start at Launch existed must stay stopped, so the
+// flag has to survive a decode that never saw the key.
+let legacy = """
+[{"id":"\(UUID().uuidString)","name":"Legacy","mode":"connect",
+  "ticket":"endpointabcdefghijklmnopqrstuvwxyz234567","port":18081}]
+"""
+let decoded = try JSONDecoder().decode([PipeProfile].self, from: Data(legacy.utf8))
+check(decoded.count == 1, "Legacy profile decodes")
+check(decoded[0].startsAutomatically == nil, "Legacy profile has no flag")
+check(!decoded[0].autoStarts, "Legacy profile must not start itself")
+check(!connect.autoStarts, "A new profile must not start itself")
+
+var starter = connect
+starter.startsAutomatically = true
+check(starter.autoStarts, "Start at Launch reads back")
+let roundTripDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+defer { try? FileManager.default.removeItem(at: roundTripDirectory) }
+let roundTrip = ProfileStore(directory: roundTripDirectory)
+try roundTrip.save([starter, share])
+let reloaded = try roundTrip.load()
+check(reloaded.first(where: { $0.id == starter.id })?.autoStarts == true, "Start at Launch survives a save")
+check(reloaded.first(where: { $0.id == share.id })?.autoStarts == false, "Other profiles stay stopped")
+
 print("Profile checks passed")

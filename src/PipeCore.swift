@@ -10,6 +10,14 @@ struct PipeProfile: Codable {
     var mode: PipeMode
     var ticket: String
     var port: UInt16
+    // Absent from every profile written before this option existed. Those
+    // profiles stay stopped at launch, which is what their owner expects.
+    var startsAutomatically: Bool? = nil
+
+    // A launchd agent used to hold this pipe up across a restart. PipeDesk
+    // owns the process now, so it must restore the pipe itself or the
+    // services above it come back to a dead port.
+    var autoStarts: Bool { startsAutomatically ?? false }
 
     func validate() throws {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {

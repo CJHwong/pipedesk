@@ -185,6 +185,59 @@ func clearStaleControlSocket(_ path: String?) {
 // removes the ambiguity, and it costs no forwarded connection to the remote.
 //
 // Socket ownership proves only local readiness. The remote service can still fail.
+// What a child's sockets say about its health.
+//
+// A process can hold its listening socket perfectly while it is on fire. The
+// leaked halves of closed connections stay in the table forever, so counting
+// them is the difference between "still bound" and "still working".
+struct SocketCensus {
+    var listens = false
+    var established = 0
+    var dead = 0
+}
+
+func censusSockets(pid: pid_t, port: UInt16) -> SocketCensus {
+    var census = SocketCensus()
+    let size = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+    guard size > 0 else { return census }
+    var descriptors = [proc_fdinfo](repeating: proc_fdinfo(),
+                                    count: Int(size) / MemoryLayout<proc_fdinfo>.stride)
+    let written = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, &descriptors, size)
+    guard written > 0 else { return census }
+    let found = Int(written) / MemoryLayout<proc_fdinfo>.stride
+    for entry in descriptors.prefix(found)
+    where entry.proc_fdtype == UInt32(PROX_FDTYPE_SOCKET) {
+        var info = socket_fdinfo()
+        let length = proc_pidfdinfo(pid, entry.proc_fd, PROC_PIDFDSOCKETINFO,
+                                    &info, Int32(MemoryLayout<socket_fdinfo>.size))
+        guard length > 0, info.psi.soi_kind == SOCKINFO_TCP else { continue }
+        let tcp = info.psi.soi_proto.pri_tcp
+        let local = UInt16(bigEndian: UInt16(truncatingIfNeeded: tcp.tcpsi_ini.insi_lport))
+        guard local == port else { continue }
+        switch tcp.tcpsi_state {
+        case Int32(TSI_S_LISTEN): census.listens = true
+        case Int32(TSI_S_ESTABLISHED): census.established += 1
+        // TSI_S__CLOSE_WAIT carries a double underscore in sys/proc_info.h.
+        case Int32(TSI_S__CLOSE_WAIT), Int32(TSI_S_CLOSED),
+             Int32(TSI_S_LAST_ACK), Int32(TSI_S_CLOSING): census.dead += 1
+        default: break
+        }
+    }
+    return census
+}
+
+// Resident size of a child, for a human reading the menu. A process that grows
+// without bound is degrading even when its socket table looks ordinary.
+func residentBytes(pid: pid_t) -> UInt64 {
+    var usage = rusage_info_v2()
+    let ok = withUnsafeMutablePointer(to: &usage) { pointer in
+        pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
+            proc_pid_rusage(pid, RUSAGE_INFO_V2, $0)
+        }
+    }
+    return ok == 0 ? usage.ri_resident_size : 0
+}
+
 func processListens(pid: pid_t, port: UInt16) -> Bool {
     let size = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
     guard size > 0 else { return false }

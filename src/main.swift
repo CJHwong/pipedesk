@@ -71,6 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // The forward becomes usable a few seconds after ssh starts, so poll
         // rather than trust the process handle alone.
         let poll = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in
+            self?.pipes.forEach { $0.inspect() }
             self?.refresh()
         }
         RunLoop.main.add(poll, forMode: .common)
@@ -85,6 +86,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Refresh on open so no switch can show a stale position.
     func menuWillOpen(_ menu: NSMenu) {
+        pipes.forEach { $0.inspect() }
         refresh()
     }
 

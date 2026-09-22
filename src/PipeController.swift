@@ -13,6 +13,18 @@ final class PipeController {
     private(set) var wantsConnection = false
     private(set) var ticket: String?
     private(set) var lastError: String?
+    private(set) var deadSockets = 0
+    private(set) var resident: UInt64 = 0
+    // Dumbpipe strands the socket halves of closed connections, one per
+    // disconnect, and a stranded half never returns to the process. Eight is
+    // well past normal churn, so restart at that point if nothing is connected
+    // and nobody pays for it.
+    private static let deadSocketLimit = 8
+    // A pipe can carry a tunnel that never disconnects, so the idle window the
+    // limit above waits for may never arrive. Past this count, restart anyway:
+    // a tunnel reconnects on its own ladder in seconds, and an unbounded leak
+    // does not stop on its own.
+    private static let deadSocketHardLimit = 64
     var autoReconnect = true {
         didSet { if !autoReconnect { retry?.invalidate(); retry = nil } }
     }
@@ -27,15 +39,53 @@ final class PipeController {
         return processListens(pid: process.processIdentifier, port: profile.port)
     }
     var status: String {
-        if ready { return profile.mode == .share ? "Sharing" : "Listening on 127.0.0.1:\(profile.port)" }
-        if let lastError { return lastError }
-        return wantsConnection ? "Starting..." : "Stopped"
+        guard ready else {
+            if let lastError { return lastError }
+            return wantsConnection ? "Starting..." : "Stopped"
+        }
+        let base = profile.mode == .share ? "Sharing" : "Listening on 127.0.0.1:\(profile.port)"
+        guard deadSockets > 0 else { return base }
+        return "\(base), \(deadSockets) stranded"
+    }
+
+    // Read the child's socket table and size. A process that holds its
+    // listening socket still reports ready, so readiness alone cannot tell a
+    // working pipe from a rotting one.
+    func inspect() {
+        guard let process, process.isRunning else {
+            deadSockets = 0
+            resident = 0
+            return
+        }
+        let census = censusSockets(pid: process.processIdentifier, port: profile.port)
+        deadSockets = census.dead
+        resident = residentBytes(pid: process.processIdentifier)
+        guard wantsConnection, autoReconnect, retry == nil else { return }
+        let idle = census.dead >= Self.deadSocketLimit && census.established == 0
+        let urgent = census.dead >= Self.deadSocketHardLimit
+        guard idle || urgent else { return }
+        let reason = urgent ? "past the hard limit" : "with nothing connected"
+        Log.write("profile \(profile.id) stranded \(census.dead) sockets \(reason), restarting")
+        restart()
+    }
+
+    // A stranded descriptor only comes back with a new process. Wait out the
+    // old child's kill deadline first, or the replacement finds the port taken.
+    private func restart() {
+        suspend()
+        let timer = Timer(timeInterval: 3, repeats: false) { [weak self] _ in self?.resume() }
+        RunLoop.main.add(timer, forMode: .common)
+        retry = timer
+        onChange?()
     }
 
     func start() {
         wantsConnection = true
         guard !isRunning else { return }
         retry?.invalidate()
+        // Clear the field, not only the timer. A spent timer left in place
+        // reads as "a start is already pending" to anything that checks.
+        retry = nil
         generation = UUID()
         lastError = nil
         do {

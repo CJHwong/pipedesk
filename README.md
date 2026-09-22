@@ -91,8 +91,11 @@ For a stable remote ticket, run `dumbpipe generate-ticket` with the same `IROH_S
 | Listening | This connection owns its local listening port. |
 | Sharing | The listener has produced a ticket. |
 | Error text | The process failed or reported an error. |
+| `N stranded` | The process holds N socket halves from connections that already closed. |
 
 Listening does not prove that the remote service responds. Open the service to check the full path.
+A stranded socket never returns to its process, so PipeDesk restarts a pipe that collects them.
+It waits for an idle moment first, and restarts regardless once the count passes a hard limit.
 The menu bar symbol has a gap when pipes are inactive or only partly ready.
 The symbol joins when all configured pipes are ready.
 

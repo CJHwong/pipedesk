@@ -427,6 +427,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             copy.representedObject = pipe.profile.id
             copy.target = self
             submenu.addItem(copy)
+            let rename = NSMenuItem(title: "Rename...", action: #selector(renamePipe(_:)), keyEquivalent: "")
+            rename.representedObject = pipe.profile.id
+            rename.target = self
+            submenu.addItem(rename)
             submenu.addItem(.separator())
             let remove = NSMenuItem(title: "Remove Profile...", action: #selector(removePipe(_:)), keyEquivalent: "")
             remove.representedObject = pipe.profile.id
@@ -484,6 +488,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let text else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    @objc private func renamePipe(_ sender: NSMenuItem) {
+        guard let pipe = selectedPipe(sender) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Rename \(pipe.profile.name)"
+        alert.informativeText = "The pipe keeps its ticket, its port and its saved identity."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = pipe.profile.name
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        var renamed = pipe.profile
+        renamed.name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard renamed.name != pipe.profile.name else { return }
+        do {
+            // Write first. A name the store rejects must leave the running
+            // pipe and the menu exactly as they were.
+            try ProfileStore.standard.save(pipes.map { $0.profile.id == renamed.id ? renamed : $0.profile })
+            pipe.profile = renamed
+            buildMenu()
+            refresh()
+        } catch { showError(error) }
     }
 
     @objc private func removePipe(_ sender: NSMenuItem) {

@@ -57,4 +57,28 @@ let reloaded = try roundTrip.load()
 check(reloaded.first(where: { $0.id == starter.id })?.autoStarts == true, "Start at Launch survives a save")
 check(reloaded.first(where: { $0.id == share.id })?.autoStarts == false, "Other profiles stay stopped")
 
+// A rename must carry the ticket, the port and the identity with it. The
+// identity file is keyed by id, so a rename that changed the id would
+// silently orphan the key and the pipe would need a fresh ticket.
+var renamed = starter
+renamed.name = "Renamed pipe"
+check(renamed.id == starter.id, "Rename changed the identity")
+check(renamed.ticket == starter.ticket, "Rename changed the ticket")
+check(renamed.port == starter.port, "Rename changed the port")
+check(renamed.autoStarts == starter.autoStarts, "Rename changed the start flag")
+try roundTrip.save([renamed, share])
+check(try roundTrip.load().contains { $0.id == starter.id && $0.name == "Renamed pipe" },
+      "Rename did not survive a save")
+
+// A blank name has to be refused at the store, not only in the dialog, and
+// the refusal must leave the saved profiles untouched.
+var blank = renamed
+blank.name = "   "
+do {
+    try roundTrip.save([blank, share])
+    fatalError("A blank name was accepted")
+} catch { }
+check(try roundTrip.load().first(where: { $0.id == starter.id })?.name == "Renamed pipe",
+      "A rejected rename damaged the saved profiles")
+
 print("Profile checks passed")

@@ -100,6 +100,7 @@ The menu bar symbol has a gap when pipes are inactive or only partly ready.
 The symbol joins when all configured pipes are ready.
 
 Start and stop each profile from its submenu. Copy tickets and local addresses from the same submenu.
+Choose **Rename** to retitle a pipe. It keeps its ticket, its port and its saved identity.
 New Dumbpipe profiles remain stopped until you start them.
 Choose **Start at Launch** in a profile's submenu to start that pipe whenever the app opens.
 Reloading profiles stops every pipe, then starts the ones set to start at launch.

@@ -67,6 +67,22 @@ Dumbpipe provides transport encryption. It does not replace the service's authen
 Connect binds only to `127.0.0.1`. Share forwards only to `127.0.0.1` on its own machine.
 The app never opens a local forward on every network interface.
 
+## Android
+
+Use [Patchpipe](https://github.com/walterl/patchpipe) to run the same Dumbpipe pipes on Android.
+Patchpipe is an independent project, not made by PipeDesk.
+PipeDesk opens its project page from **Get Patchpipe for Android (not made by PipeDesk)**.
+
+1. In PipeDesk, choose **Export for Android...** and save the file.
+2. Move the file to the phone and choose **Import config** in Patchpipe.
+3. Start each pipe from its switch.
+
+A Connect pipe keeps its ticket. A Share pipe keeps its saved identity, so it keeps its ticket too.
+A replaced pipe keeps its on/off state, and a new pipe starts stopped. The export leaves the phone's launch setting alone.
+
+**The export file contains tickets and identity keys in plaintext.** Move it, import it, then delete it.
+A share identity works on one device at a time. Stop the Mac's share before you start it on the phone.
+
 ## Remote setup
 
 Open **Add Pipe or Set Up Remote**, then choose **Remote Setup**.
@@ -164,7 +180,7 @@ Set `PIPEDESK_CONFIG_DIR` to isolate profiles during development or tests.
 ./scripts/test.sh --live
 ```
 
-The first command checks configuration rules and builds the app with compiler warnings treated as errors.
+The first command checks configuration rules and the Android export mapping, and builds the app with compiler warnings treated as errors.
 The live command also sends synthetic bytes through actual Dumbpipe processes and the application's process controllers.
 It checks retained identity after a listener restart and cleans up its own test processes.
 It needs Dumbpipe and network access to its discovery and relay services.

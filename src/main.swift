@@ -1,6 +1,9 @@
 import AppKit
 import ServiceManagement
 
+// One place to change if the Android app moves to a fork.
+let androidAppURL = URL(string: "https://github.com/walterl/patchpipe")!
+
 // MARK: - Switch
 
 // AppKit's NSSwitch always uses the system accent colour, with no public way
@@ -241,7 +244,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem(title: "Add Pipe or Set Up Remote...", action: #selector(showSetup), keyEquivalent: "n"))
         menu.addItem(NSMenuItem(title: "Choose Dumbpipe Executable...", action: #selector(chooseDumbpipe), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Import SSH Configuration...", action: #selector(importSSH), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Export for Android...", action: #selector(exportAndroid), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Open Logs", action: #selector(openLogs), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Get Patchpipe for Android (not made by PipeDesk)",
+                                action: #selector(openAndroidApp), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Edit SSH Configuration...",
                                 action: #selector(editConfig), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Reload Configuration",
@@ -563,6 +569,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             loadConfigAndStart(restartingAgents: true)
             refresh()
         } catch { showError(error) }
+    }
+
+    @objc private func exportAndroid() {
+        do {
+            let profiles = try ProfileStore.standard.load()
+            guard !profiles.isEmpty else {
+                throw PipeError.invalid("There are no pipes to export.")
+            }
+            let config = try PatchpipeExport.config(for: profiles, secret: IdentityStore.secret(for:))
+            let contents = try PatchpipeExport.encode(config)
+
+            let panel = NSSavePanel()
+            panel.title = "Export pipes for Patchpipe"
+            panel.nameFieldStringValue = "patchpipe-config.json"
+            panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Downloads")
+            panel.canCreateDirectories = true
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            try contents.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                                 ofItemAtPath: url.path)
+
+            let alert = NSAlert()
+            alert.messageText = "Exported \(config.pipes.count) pipes"
+            alert.informativeText = "Move the file to the phone and choose Import config in Patchpipe. The file holds tickets and identity keys, so delete it after the import."
+            alert.runModal()
+        } catch { showError(error) }
+    }
+
+    @objc private func openAndroidApp() {
+        NSWorkspace.shared.open(androidAppURL)
     }
 
     @objc private func openLogs() {

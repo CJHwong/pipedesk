@@ -4,6 +4,9 @@ cd "$(dirname "$0")/.."
 mkdir -p .build/tests
 swiftc -warnings-as-errors src/PipeCore.swift tests/main.swift -o .build/tests/profiles
 .build/tests/profiles
+swiftc -warnings-as-errors src/PipeCore.swift src/PatchpipeExport.swift \
+    tests/export/main.swift -o .build/tests/export
+.build/tests/export
 swiftc -warnings-as-errors src/PipeCore.swift src/SSHController.swift tests/ssh/main.swift -o .build/tests/ssh
 .build/tests/ssh
 ./build.sh

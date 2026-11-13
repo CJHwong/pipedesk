@@ -98,11 +98,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let (config, error) = Config.load()
         configError = error
         if let error { Log.write("config: \(error)") }
+        let retiredLabels: Set<String>
+        do {
+            let directory = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/LaunchAgents")
+            let agents = try LegacyTunnelAgent.find(in: directory, aliases: Set(config.tunnels.map(\.tunnelAlias)))
+            for agent in agents { try agent.retire() }
+            retiredLabels = Set(agents.map(\.label))
+        } catch {
+            let message = "SSH tunnels stopped: \(error.localizedDescription)"
+            configError = message
+            Log.write(message)
+            rows = []
+            buildMenu()
+            return
+        }
         rows = config.tunnels.map { TunnelRow(config: $0) }
         for row in rows {
             row.controller.onStateChange = { [weak self] in self?.refresh() }
         }
-        if restartingAgents { restartAgents(from: config) }
+        if restartingAgents { restartAgents(from: config, excluding: retiredLabels) }
         buildMenu()
         startTunnelsWhenPipesReady()
     }
@@ -155,9 +170,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // first connection attempt can still lose the race and see a refused port.
     // That is what the retry ladder is for, and one extra rung at login is not
     // worth a sleep here to paper over.
-    private func restartAgents(from config: Config) {
+    private func restartAgents(from config: Config, excluding retiredLabels: Set<String>) {
         var labels: [String] = []
-        for label in config.tunnels.compactMap(\.restartAgent) where !labels.contains(label) {
+        for label in config.tunnels.compactMap(\.restartAgent)
+        where !labels.contains(label) && !retiredLabels.contains(label) {
             labels.append(label)
         }
         for label in labels {
@@ -201,6 +217,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func buildMenu() {
         let menu = NSMenu()
         menu.delegate = self
+
+        let summary = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        summary.tag = 110
+        menu.addItem(summary)
+        let controls = NSMenuItem(title: "Stop tunnels and pipes separately", action: nil, keyEquivalent: "")
+        controls.toolTip = "Stopping an SSH tunnel keeps its transport pipe running. Stop the pipe from its own submenu."
+        menu.addItem(controls)
+        menu.addItem(.separator())
 
         if let configError {
             let warning = NSMenuItem(title: configError, action: nil, keyEquivalent: "")
@@ -325,13 +349,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             row.toggleSwitch.isOn = row.controller.wantsConnection
         }
 
-        let readyCount = states.filter { $0 == .up }.count + pipes.filter(\.ready).count
+        let unhealthy = pipes.filter(\.unhealthy).count
+        let readyCount = states.filter { $0 == .up }.count + pipes.filter { $0.ready && !$0.unhealthy }.count
         let total = rows.count + pipes.count
         let active = rows.contains { $0.controller.isRunning } || pipes.contains { $0.wantsConnection }
         statusItem.button?.image = PipeIcon.image(connected: total > 0 && readyCount == total, active: active)
-        let description = "PipeDesk: \(readyCount) of \(total) pipes ready"
+        let summary = connectionSummary(tunnels: rows.filter { $0.controller.isRunning }.count,
+                                        pipes: pipes.filter(\.isRunning).count, unhealthy: unhealthy)
+        let description = "PipeDesk: \(summary). Local listeners do not prove remote health."
         statusItem.button?.image?.accessibilityDescription = description
         statusItem.button?.toolTip = description
+        statusItem.menu?.item(withTag: 110)?.title = summary
         updatePipeMenu()
 
         statusItem.menu?.item(withTitle: "Reconnect Automatically")?.state =
@@ -343,8 +371,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // "Disconnected" alone hides a misconfigured remote. Show ssh's own reason
     // and when the next attempt happens.
     private func statusText(for row: TunnelRow, state: TunnelState) -> String {
-        if state != .down { return state.label }
-        let reason = row.controller.lastError.map(shorten) ?? state.label
+        if state != .down || !row.controller.wantsConnection { return row.controller.status }
+        let reason = row.controller.lastError.map(shorten) ?? row.controller.status
         if let next = row.controller.nextRetry {
             let seconds = max(0, Int(next.timeIntervalSinceNow.rounded()))
             return "\(reason)  - retry in \(seconds)s"
@@ -455,7 +483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for item in statusItem.menu?.items ?? [] {
             guard let identifier = item.representedObject as? UUID,
                   let pipe = pipes.first(where: { $0.profile.id == identifier }) else { continue }
-            item.state = pipe.ready ? .on : .off
+            item.state = pipe.ready && !pipe.unhealthy ? .on : .off
             item.submenu?.item(withTag: 101)?.title = pipe.status
             item.submenu?.item(withTag: 104)?.title = "Last error: \(pipe.lastError ?? "")"
             item.submenu?.item(withTag: 104)?.isHidden = pipe.lastError == nil

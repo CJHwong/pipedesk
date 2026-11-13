@@ -33,6 +33,7 @@ final class PipeController {
     init(profile: PipeProfile) { self.profile = profile }
 
     var isRunning: Bool { process?.isRunning ?? false }
+    var unhealthy: Bool { isRunning && deadSockets >= Self.deadSocketLimit }
     var ready: Bool {
         guard let process, process.isRunning else { return false }
         if profile.mode == .share { return listenerStarted && ticket != nil }
@@ -43,8 +44,9 @@ final class PipeController {
             if let lastError { return lastError }
             return wantsConnection ? "Starting..." : "Stopped"
         }
-        let base = profile.mode == .share ? "Sharing" : "Listening on 127.0.0.1:\(profile.port)"
+        let base = profile.mode == .share ? "Sharing" : "Listening locally on 127.0.0.1:\(profile.port)"
         guard deadSockets > 0 else { return base }
+        if unhealthy { return "Unhealthy: \(deadSockets) stranded sockets" }
         return "\(base), \(deadSockets) stranded"
     }
 

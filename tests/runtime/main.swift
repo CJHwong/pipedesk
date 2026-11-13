@@ -108,24 +108,46 @@ let fakeSource = """
 #!/usr/bin/python3
 import os
 import signal
-import time
+import socket
+import sys
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
+listener = socket.socket()
+listener.bind(("127.0.0.1", int(sys.argv[3].rsplit(":", 1)[1])))
+listener.listen(16)
+connections = []
 with open(os.environ["PIPEDESK_TEST_PID"], "w") as output:
     output.write(str(os.getpid()))
 while True:
-    time.sleep(1)
+    accepted, address = listener.accept()
+    accepted.sendall(accepted.recv(4096))
+    connections.append(accepted)
 """
 try fakeSource.write(to: fakeBinary, atomically: true, encoding: .utf8)
 try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: fakeBinary.path)
 setenv("PIPEDESK_TEST_PID", pidFile.path, 1)
 UserDefaults.standard.set(fakeBinary.path, forKey: "dumbpipeBinary")
 defer { UserDefaults.standard.removeObject(forKey: "dumbpipeBinary") }
+let fakePort = unusedPort()
 let stubborn = PipeController(profile: PipeProfile(id: UUID(), name: "Termination check", mode: .connect,
-                                                  ticket: ticket, port: unusedPort()))
+                                                  ticket: ticket, port: fakePort))
 cleanup = { stubborn.shutdown() }
+stubborn.autoReconnect = false
 stubborn.start()
 require(spin(until: { FileManager.default.fileExists(atPath: pidFile.path) }, seconds: 5), "Fake child did not start")
 let childPID = Int32(try String(contentsOf: pidFile, encoding: .utf8))!
+require(stubborn.ready, "The synthetic pipe did not listen")
+stubborn.inspect()
+require(!stubborn.unhealthy, "A fresh pipe reported unhealthy")
+require(stubborn.status == "Listening locally on 127.0.0.1:\(fakePort)", "Local readiness reported remote health")
+for _ in 0..<8 {
+    require(echo(port: fakePort), "The synthetic pipe did not carry traffic")
+}
+require(spin(until: { stubborn.inspect(); return stubborn.deadSockets == 8 }, seconds: 5),
+        "The synthetic pipe did not retain eight closed sockets")
+require(stubborn.unhealthy, "A pipe with stranded sockets reported healthy")
+require(stubborn.status == "Unhealthy: 8 stranded sockets", "The pipe status hid its stranded sockets")
+print("Unhealthy pipe status reflects real stranded sockets")
 stubborn.shutdown()
 require(kill(childPID, 0) != 0, "Child survived application shutdown")
+require(stubborn.status == "Stopped" && !stubborn.unhealthy, "A stopped pipe still reported unhealthy")
 print("Application shutdown removes children that ignore termination")

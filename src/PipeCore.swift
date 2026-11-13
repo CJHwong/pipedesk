@@ -1,5 +1,10 @@
 import Foundation
 
+func connectionSummary(tunnels: Int, pipes: Int, unhealthy: Int) -> String {
+    let summary = "Tunnels running: \(tunnels), pipes running: \(pipes)"
+    return unhealthy > 0 ? "\(summary), unhealthy pipes: \(unhealthy)" : summary
+}
+
 enum PipeMode: String, Codable {
     case connect, share
 }

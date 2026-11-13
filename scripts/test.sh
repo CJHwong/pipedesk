@@ -7,10 +7,12 @@ swiftc -warnings-as-errors src/PipeCore.swift tests/main.swift -o .build/tests/p
 swiftc -warnings-as-errors src/PipeCore.swift src/PatchpipeExport.swift \
     tests/export/main.swift -o .build/tests/export
 .build/tests/export
-swiftc -warnings-as-errors src/PipeCore.swift src/SSHController.swift tests/ssh/main.swift -o .build/tests/ssh
+swiftc -warnings-as-errors src/PipeCore.swift src/SSHController.swift src/LegacyTunnelAgent.swift \
+    tests/ssh/main.swift -o .build/tests/ssh
 .build/tests/ssh
 ./build.sh
 if [ "${1:-}" = "--live" ]; then
+    python3 tests/legacy-agent.py
     swiftc -warnings-as-errors src/PipeCore.swift src/PipeController.swift src/SSHController.swift \
         tests/runtime/main.swift -o .build/tests/runtime
     PIPEDESK_RUNTIME_TEST_BIN="$PWD/.build/tests/runtime" python3 tests/live-pipe.py

@@ -6,6 +6,45 @@ let valid = Data("""
 let config = try Config.decode(valid)
 precondition(config.tunnels.count == 1)
 precondition(config.tunnels[0].sshArguments.suffix(2) == ["--", "example"])
+let legacyAgent: [String: Any] = [
+    "Label": "test.example-forward",
+    "ProgramArguments": [sshPath, "-N", "-o", "BatchMode=yes", "example"]
+]
+let matchedAgent = LegacyTunnelAgent(propertyList: legacyAgent, aliases: ["example"])
+precondition(matchedAgent?.label == "test.example-forward", "A duplicate tunnel agent was missed")
+precondition(LegacyTunnelAgent(propertyList: legacyAgent, aliases: ["other"]) == nil,
+             "An unrelated tunnel agent matched")
+var dependencyAgent = legacyAgent
+dependencyAgent["ProgramArguments"] = ["/usr/local/bin/dumbpipe", "connect-tcp", "example"]
+precondition(LegacyTunnelAgent(propertyList: dependencyAgent, aliases: ["example"]) == nil,
+             "A transport dependency matched")
+var shellAgent = legacyAgent
+shellAgent["ProgramArguments"] = [sshPath, "example"]
+precondition(LegacyTunnelAgent(propertyList: shellAgent, aliases: ["example"]) == nil,
+             "A shell session matched")
+var commandAgent = legacyAgent
+commandAgent["ProgramArguments"] = [sshPath, "-N", "other", "example"]
+precondition(LegacyTunnelAgent(propertyList: commandAgent, aliases: ["example"]) == nil,
+             "A remote command matched")
+var alternateConfig = legacyAgent
+alternateConfig["ProgramArguments"] = [sshPath, "-N", "-F", "/tmp/other-config", "example"]
+precondition(LegacyTunnelAgent(propertyList: alternateConfig, aliases: ["example"]) == nil,
+             "A tunnel with another configuration matched")
+for override in ["HostName=other.invalid", "Port=2200", "ProxyJump=other", "RemoteCommand=example",
+                 "LocalForward=9999:127.0.0.1:80", "RemoteForward=9999:127.0.0.1:80"] {
+    var distinctTunnel = legacyAgent
+    distinctTunnel["ProgramArguments"] = [sshPath, "-N", "-o", override, "example"]
+    precondition(LegacyTunnelAgent(propertyList: distinctTunnel, aliases: ["example"]) == nil,
+                 "A distinct tunnel matched: \(override)")
+}
+let stoppedTunnel = TunnelController(config: config.tunnels[0])
+stoppedTunnel.stop()
+precondition(stoppedTunnel.status == "Stopped", "A stopped tunnel reported a connection failure")
+precondition(connectionSummary(tunnels: 0, pipes: 1, unhealthy: 0)
+             == "Tunnels running: 0, pipes running: 1", "A running pipe disappeared from the summary")
+precondition(connectionSummary(tunnels: 1, pipes: 1, unhealthy: 1)
+             == "Tunnels running: 1, pipes running: 1, unhealthy pipes: 1",
+             "The summary hid an unhealthy pipe")
 let invalid = Data("""
 {"tunnels":[{"name":"Example","tunnelAlias":"-Fbad","probePort":8080,"links":[]}]}
 """.utf8)
@@ -77,3 +116,12 @@ close(accepted)
 close(listener)
 
 print("SSH import and socket cleanup checks passed")
+
+if CommandLine.arguments.count == 4, CommandLine.arguments[1] == "--retire-agent" {
+    let directory = URL(fileURLWithPath: CommandLine.arguments[2])
+    let agents = try LegacyTunnelAgent.find(in: directory, aliases: [CommandLine.arguments[3]])
+    precondition(agents.count == 1, "Migration did not select only the duplicate agent")
+    try agents[0].retire()
+    try agents[0].retire()
+    print("Legacy SSH job retirement survives a repeated call")
+}

@@ -292,6 +292,12 @@ final class TunnelController {
 
     var isRunning: Bool { task?.isRunning ?? false }
 
+    var status: String {
+        if !userWantsTunnel { return "Stopped" }
+        if state == .up { return "Forwarding locally" }
+        return state.label
+    }
+
     func start() {
         userWantsTunnel = true
         suspendedForSleep = false

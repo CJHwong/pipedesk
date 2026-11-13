@@ -105,15 +105,25 @@ For a stable remote ticket, run `dumbpipe generate-ticket` with the same `IROH_S
 | Stopped | PipeDesk does not want this process running. |
 | Starting | The process has not reached local readiness. |
 | Listening | This connection owns its local listening port. |
+| Forwarding locally | The SSH process owns its local forwarding port. |
 | Sharing | The listener has produced a ticket. |
 | Error text | The process failed or reported an error. |
 | `N stranded` | The process holds N socket halves from connections that already closed. |
+| `Unhealthy: N stranded sockets` | The pipe holds at least eight stranded sockets. |
 
 Listening does not prove that the remote service responds. Open the service to check the full path.
 A stranded socket never returns to its process, so PipeDesk restarts a pipe that collects them.
 It waits for an idle moment first, and restarts regardless once the count passes a hard limit.
 The menu bar symbol has a gap when pipes are inactive or only partly ready.
 The symbol joins when all configured pipes are ready.
+An unhealthy pipe does not count as ready in the menu bar.
+The menu and its tooltip show separate counts for running tunnels and pipes.
+
+SSH tunnels and transport pipes have separate controls.
+Stopping an SSH tunnel leaves its transport pipe running.
+Stop that pipe from its own submenu to close its listener.
+`Stopped` means that you switched the tunnel off. `Disconnected` means a requested tunnel is down.
+Local listeners do not prove remote health.
 
 Start and stop each profile from its submenu. Copy tickets and local addresses from the same submenu.
 Choose **Rename** to retitle a pipe. It keeps its ticket, its port and its saved identity.
@@ -130,7 +140,13 @@ A tunnel from `ssh.json` waits for the pipes to listen before its first attempt,
 PipeDesk reads tunnel profiles from `~/.config/pipedesk/ssh.json`.
 Choose **Import SSH Configuration** to copy an existing configuration file into that location.
 Import retains the original file and starts the configured tunnels.
-Import starts the configured tunnels. Imported `restartAgent` labels restart during import and application startup.
+Imported `restartAgent` labels restart their dependencies during import and application startup.
+Before starting SSH tunnels, PipeDesk checks user LaunchAgents for duplicate direct `ssh -N` commands with the same alias.
+It disables and unloads those duplicate jobs. Their property list files remain available for recovery.
+The disabled jobs stay disabled across login. PipeDesk becomes the only owner of those tunnels.
+It preserves jobs for other aliases, shell sessions, alternate SSH configurations, and underlying transport services.
+Migration accepts only the legacy `BatchMode`, `ExitOnForwardFailure`, `ServerAliveInterval`, and `ServerAliveCountMax` options.
+If migration fails, PipeDesk shows an error and leaves its SSH tunnels stopped.
 PipeDesk uses existing SSH aliases, port forwards, and authentication.
 Use **Edit SSH Configuration** to add or change aliases after import.
 

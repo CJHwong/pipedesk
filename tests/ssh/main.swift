@@ -70,6 +70,26 @@ precondition(Link(label: "Screen", url: "vnc://localhost").localPort == 5900, "M
 precondition(Link(label: "Remote", url: "https://example.com:8443").localPort == nil,
              "A remote link was treated as local")
 
+// Each local link becomes one forward, so the ssh config needs only the host.
+let forwarded = try Config.decode(Data("""
+{"tunnels":[{"name":"Example","tunnelAlias":"example","probePort":7428,"links":[
+  {"label":"Web","url":"http://localhost:7428","remotePort":7427},
+  {"label":"Screen","url":"vnc://localhost"},
+  {"label":"Docs","url":"https://example.com"}]}]}
+""".utf8)).tunnels[0]
+precondition(forwarded.sshArguments.suffix(6) == ["-L", "7428:127.0.0.1:7427", "-L", "5900:127.0.0.1:5900",
+                                                  "--", "example"],
+             "Links did not become forwards: \(forwarded.sshArguments)")
+for badLink in [#"{"label":"Web","url":"http://localhost:80","remotePort":0}"#,
+                #"{"label":"Docs","url":"https://example.com","remotePort":443}"#] {
+    do {
+        _ = try Config.decode(Data("""
+        {"tunnels":[{"name":"Example","tunnelAlias":"example","probePort":80,"links":[\(badLink)]}]}
+        """.utf8))
+        fatalError("A link with an unusable remote port was accepted: \(badLink)")
+    } catch { precondition(error is PipeError) }
+}
+
 // A config edit restarts only the tunnels it changed.
 func tunnel(_ name: String, port: UInt16) -> TunnelConfig {
     TunnelConfig(name: name, tunnelAlias: name.lowercased(), shellAlias: nil, probePort: port,

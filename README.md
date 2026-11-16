@@ -181,7 +181,10 @@ The SSH configuration format is:
       "tunnelAlias": "example-forward",
       "shellAlias": "example-shell",
       "probePort": 8080,
-      "links": [{"label": "Web service", "url": "http://127.0.0.1:8080"}],
+      "links": [
+        {"label": "Web service", "url": "http://127.0.0.1:8080"},
+        {"label": "Screen Sharing", "url": "vnc://localhost:5901", "remotePort": 5900}
+      ],
       "controlPath": "~/.ssh/example-control.sock"
     }
   ]
@@ -189,6 +192,9 @@ The SSH configuration format is:
 ```
 
 Define these aliases in `~/.ssh/config`. PipeDesk runs the forward alias with `ssh -N`.
+The alias needs only the host details. PipeDesk adds one `-L` forward for each link to `localhost`, `127.0.0.1` or `::1`.
+The forward goes to the same port on the remote's `127.0.0.1`. Set `remotePort` when the remote port differs.
+A `LocalForward` that repeats one of these is harmless, because ssh skips the duplicate.
 New installations have no personal aliases, ports, or service links.
 Invalid configuration does not start example connections.
 

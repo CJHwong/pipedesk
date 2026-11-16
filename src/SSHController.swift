@@ -48,6 +48,10 @@ enum Log {
 struct Link: Codable, Equatable {
     let label: String
     let url: String
+    // The service's port on the remote, when it differs from the local one.
+    // Screen Sharing listens on 5900 everywhere, so a second remote needs
+    // another local port for it.
+    var remotePort: UInt16?
 
     // The local port a link reaches its service through. A link to another
     // host does not go through the tunnel, so it has nothing to check here.
@@ -61,6 +65,13 @@ struct Link: Codable, Equatable {
         case "https": return 443
         default: return nil
         }
+    }
+
+    // The ssh -L value that carries this link. The remote services listen
+    // only on the remote's own loopback, so every local link needs one.
+    var forward: String? {
+        guard let local = localPort else { return nil }
+        return "\(local):127.0.0.1:\(remotePort ?? local)"
     }
 
     // Shown under the label in the menu. "http://localhost:7427" reads better
@@ -105,8 +116,12 @@ struct TunnelConfig: Codable, Equatable {
          "-o", "BatchMode=yes",
          "-o", "ExitOnForwardFailure=yes",
          "-o", "ServerAliveInterval=30",
-         "-o", "ServerAliveCountMax=3",
-         "--", tunnelAlias]
+         "-o", "ServerAliveCountMax=3"]
+            // The forwards live here rather than in the ssh config, so a link
+            // and its forward cannot drift apart. ssh drops a forward that
+            // repeats one from the config, so an old config still works.
+            + links.compactMap(\.forward).flatMap { ["-L", $0] }
+            + ["--", tunnelAlias]
     }
 
 }
@@ -134,6 +149,11 @@ struct Config: Codable {
             guard !tunnel.name.isEmpty, !tunnel.tunnelAlias.isEmpty,
                   !tunnel.tunnelAlias.hasPrefix("-"), tunnel.probePort > 0 else {
                 throw PipeError.invalid("Each SSH profile needs a name, alias, and port from 1 to 65535.")
+            }
+            for link in tunnel.links where link.remotePort != nil {
+                guard link.remotePort != 0, link.localPort != nil else {
+                    throw PipeError.invalid("\(tunnel.name): \(link.label) needs a localhost URL and a remotePort from 1 to 65535.")
+                }
             }
         }
         return config

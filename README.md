@@ -71,7 +71,7 @@ The app never opens a local forward on every network interface.
 
 Use [Patchpipe](https://github.com/walterl/patchpipe) to run the same Dumbpipe pipes on Android.
 Patchpipe is an independent project, not made by PipeDesk.
-PipeDesk opens its project page from **Get Patchpipe for Android (not made by PipeDesk)**.
+PipeDesk opens its project page from **Get Patchpipe for Android**, marked as not made by PipeDesk.
 
 1. In PipeDesk, choose **Export for Android...** and save the file.
 2. Move the file to the phone and choose **Import config** in Patchpipe.
@@ -100,12 +100,30 @@ For a stable remote ticket, run `dumbpipe generate-ticket` with the same `IROH_S
 
 ## Status and controls
 
+An SSH tunnel shows one status line:
+
+| Status | Meaning |
+|---|---|
+| Off | You switched the tunnel off. |
+| Connecting... | ssh runs but does not hold its local port yet. |
+| Tunnel up, checking services... | The tunnel holds its port. The first service check has not finished. |
+| Connected | The tunnel holds its port and every linked service answered. |
+| Tunnel up, NAME not responding | The tunnel works, but the named service on the remote does not answer. |
+| Retrying in Ns: reason | ssh failed. The reason is ssh's own last message. |
+| Not connected | ssh is down and reported no reason. |
+
+Each link has a dot. A green dot means its service answered the last check. A grey dot means it did not answer or has not been checked.
+PipeDesk checks each link that points at `localhost` every 30 seconds and when you open the menu.
+A check opens one connection to the local port and closes it. ssh closes the connection at once when the remote service refuses it. A live service keeps it open or sends a greeting.
+A tunnel with no local links checks its `probePort` instead.
+
+A pipe shows its status in its submenu:
+
 | Status | Meaning |
 |---|---|
 | Stopped | PipeDesk does not want this process running. |
 | Starting | The process has not reached local readiness. |
 | Listening | This connection owns its local listening port. |
-| Forwarding locally | The SSH process owns its local forwarding port. |
 | Sharing | The listener has produced a ticket. |
 | Error text | The process failed or reported an error. |
 | `N stranded` | The process holds N socket halves from connections that already closed. |
@@ -122,17 +140,20 @@ The menu and its tooltip show separate counts for running tunnels and pipes.
 SSH tunnels and transport pipes have separate controls.
 Stopping an SSH tunnel leaves its transport pipe running.
 Stop that pipe from its own submenu to close its listener.
-`Stopped` means that you switched the tunnel off. `Disconnected` means a requested tunnel is down.
-Local listeners do not prove remote health.
+PipeDesk notices an edited `ssh.json` within two seconds. It keeps every tunnel the edit did not change and restarts only the changed ones.
+A file with an error keeps the running tunnels and shows the error in the menu.
+When the network changes, a tunnel that waits for its next retry tries again at once.
+Rarely used items sit under the **Settings** heading at the bottom of the menu.
 
-Start and stop each profile from its submenu. Copy tickets and local addresses from the same submenu.
-Choose **Rename** to retitle a pipe. It keeps its ticket, its port and its saved identity.
+Pipes appear under **Dumbpipe Pipes**. Each row shows the local address and a status dot: green when ready, orange when unhealthy, red after an error, grey when stopped.
+Start and stop each pipe from its submenu. Copy tickets and local addresses from the same submenu.
+Choose **Rename Pipe** to retitle a pipe. It keeps its ticket, its port and its saved identity.
 New Dumbpipe profiles remain stopped until you start them.
-Choose **Start at Launch** in a profile's submenu to start that pipe whenever the app opens.
+Choose **Start When PipeDesk Opens** in a pipe's submenu to start that pipe whenever the app opens.
 Reloading profiles stops every pipe, then starts the ones set to start at launch.
 Automatic reconnection retries failed processes with a delay from five seconds to one minute.
 Sleep stops active processes. Wake restarts the profiles that were active before sleep.
-**Open at Login** starts the app. Pair it with **Start at Launch** to restore a pipe after a restart.
+**Open at Login** starts the app. Pair it with **Start When PipeDesk Opens** to restore a pipe after a restart.
 A tunnel from `ssh.json` waits for the pipes to listen before its first attempt, for up to 30 seconds.
 
 ## PipeDesk configuration

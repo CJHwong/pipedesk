@@ -1,8 +1,33 @@
 import AppKit
+import Network
 import ServiceManagement
 
 // One place to change if the Android app moves to a fork.
 let androidAppURL = URL(string: "https://github.com/walterl/patchpipe")!
+
+// MARK: - Layout
+
+// One grid for the whole menu, measured from the menu's left edge. AppKit
+// places plain item text at 23 points and the text after an item's icon at
+// 45 (measured on macOS 26). The custom tunnel rows must land on the same
+// lines, and the address column, the shell commands and the switches all end
+// at one right edge.
+enum MenuGrid {
+    static let textStart: CGFloat = 23
+    static let iconStart: CGFloat = 23
+    static let iconWidth: CGFloat = 16
+    static let iconTextStart: CGFloat = 45
+    static let rightEdge: CGFloat = 307
+    // The right padding mirrors the left, so the rows that are views set the
+    // menu's width and the switches and dots sit as close to the edge as the
+    // labels sit to the other one.
+    static let menuWidth: CGFloat = rightEdge + textStart - menuInset
+    // The menu draws its own edge beyond a view's frame (measured on macOS 26).
+    static let menuInset: CGFloat = 8
+    static let rowHeight: CGFloat = 24
+    static let labelFont = NSFont.menuFont(ofSize: 0)
+    static let detailFont = NSFont.menuFont(ofSize: NSFont.systemFontSize(for: .small))
+}
 
 // MARK: - Switch
 
@@ -12,7 +37,7 @@ final class TunnelSwitch: NSView {
     var isOn = false { didSet { needsDisplay = true } }
     var onToggle: (() -> Void)?
 
-    override var intrinsicContentSize: NSSize { NSSize(width: 42, height: 24) }
+    override var intrinsicContentSize: NSSize { NSSize(width: 32, height: 18) }
     override var isFlipped: Bool { false }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -43,12 +68,32 @@ final class TunnelRow {
     let controller: TunnelController
     let toggleSwitch = TunnelSwitch()
     let statusLabel = NSTextField(labelWithString: "")
+    // The latest answer from each link's service, keyed by link URL. Empty
+    // until the first check after the tunnel comes up.
+    var health: [String: ServiceHealth] = [:]
+    var checking = false
+    var lastState: TunnelState?
+    var linkRows: [(link: Link, view: MenuRowView)] = []
 
     init(config: TunnelConfig) {
         controller = TunnelController(config: config)
     }
 
     var name: String { controller.config.name }
+
+    // The links whose service can be checked through this tunnel. With no
+    // link, the probe port stands in, so a bare tunnel still gets a check.
+    var checkedPorts: [(key: String, label: String, port: UInt16)] {
+        let links = controller.config.links.compactMap { link in
+            link.localPort.map { (key: link.url, label: link.label, port: $0) }
+        }
+        if !links.isEmpty { return links }
+        let port = controller.config.probePort
+        return [(key: "port:\(port)", label: "port \(port)", port: port)]
+    }
+
+    var servicesChecked: Bool { checkedPorts.allSatisfy { health[$0.key] != nil } }
+    var silentLinks: [String] { checkedPorts.filter { health[$0.key] == .notAnswering }.map(\.label) }
 }
 
 // MARK: - App
@@ -61,24 +106,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var instanceLock: Int32 = -1
     private var configError: String?
     private var pollTimer: Timer?
+    private var serviceTimer: Timer?
     private var signalSources: [DispatchSourceSignal] = []
+    private var configStamp: Date?
+    private let pathMonitor = NWPathMonitor()
+    private var pathSignature: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard acquireInstanceLock() else { NSApp.terminate(nil); return }
         Log.write("app launched")
         trapSignals()
         observePowerEvents()
+        observeNetworkChanges()
         loadPipes()
         loadConfigAndStart(restartingAgents: true)
         if rows.isEmpty && pipes.isEmpty { showSetup() }
         // The forward becomes usable a few seconds after ssh starts, so poll
-        // rather than trust the process handle alone.
+        // rather than trust the process handle alone. The same tick notices
+        // an edited ssh.json, because a tunnel left running an alias that no
+        // longer exists fails with nothing in the menu to say why.
         let poll = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in
             self?.pipes.forEach { $0.inspect() }
+            self?.reloadConfigIfEdited()
             self?.refresh()
         }
         RunLoop.main.add(poll, forMode: .common)
         pollTimer = poll
+        // Each check opens one connection to each service, so it runs far
+        // less often than the poll.
+        let services = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            self?.checkServices()
+        }
+        RunLoop.main.add(services, forMode: .common)
+        serviceTimer = services
         refresh()
     }
 
@@ -87,24 +147,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pipes.forEach { $0.shutdown() }
     }
 
-    // Refresh on open so no switch can show a stale position.
+    // Refresh on open so no switch can show a stale position, and check the
+    // services so the dots describe now rather than up to 30 seconds ago.
     func menuWillOpen(_ menu: NSMenu) {
         pipes.forEach { $0.inspect() }
+        checkServices()
         refresh()
     }
 
     private func loadConfigAndStart(restartingAgents: Bool = false) {
         rows.forEach { $0.controller.stop() }
+        configStamp = configModificationDate()
         let (config, error) = Config.load()
         configError = error
         if let error { Log.write("config: \(error)") }
         let retiredLabels: Set<String>
         do {
-            let directory = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/LaunchAgents")
-            let agents = try LegacyTunnelAgent.find(in: directory, aliases: Set(config.tunnels.map(\.tunnelAlias)))
-            for agent in agents { try agent.retire() }
-            retiredLabels = Set(agents.map(\.label))
+            retiredLabels = try retireDuplicateAgents(for: config.tunnels)
         } catch {
             let message = "SSH tunnels stopped: \(error.localizedDescription)"
             configError = message
@@ -113,13 +172,134 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             buildMenu()
             return
         }
-        rows = config.tunnels.map { TunnelRow(config: $0) }
-        for row in rows {
-            row.controller.onStateChange = { [weak self] in self?.refresh() }
-        }
+        rows = config.tunnels.map(makeRow)
         if restartingAgents { restartAgents(from: config, excluding: retiredLabels) }
         buildMenu()
         startTunnelsWhenPipesReady()
+    }
+
+    private func makeRow(_ config: TunnelConfig) -> TunnelRow {
+        let row = TunnelRow(config: config)
+        row.controller.onStateChange = { [weak self] in self?.refresh() }
+        return row
+    }
+
+    private func retireDuplicateAgents(for tunnels: [TunnelConfig]) throws -> Set<String> {
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents")
+        let agents = try LegacyTunnelAgent.find(in: directory, aliases: Set(tunnels.map(\.tunnelAlias)))
+        for agent in agents { try agent.retire() }
+        return Set(agents.map(\.label))
+    }
+
+    // MARK: Config changes
+
+    private func configModificationDate() -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: Config.path))?[.modificationDate] as? Date
+    }
+
+    private func reloadConfigIfEdited() {
+        let stamp = configModificationDate()
+        guard stamp != configStamp else { return }
+        configStamp = stamp
+        applyEditedConfig()
+    }
+
+    // Keep every tunnel the edit did not touch, so one changed alias does not
+    // drop the sessions running through the rest. A file caught half-written
+    // or broken keeps the running tunnels and shows the error instead.
+    private func applyEditedConfig() {
+        let (config, error) = Config.load()
+        if let error {
+            configError = error
+            Log.write("config: \(error); keeping the running tunnels")
+            buildMenu()
+            refresh()
+            return
+        }
+        configError = nil
+        let matches = matchTunnels(current: rows.map(\.controller.config), next: config.tunnels)
+        let kept = Set(matches.compactMap { $0 })
+        let removed = rows.indices.filter { !kept.contains($0) }.map { rows[$0] }
+        let next = zip(config.tunnels, matches).map { tunnel, index in index.map { rows[$0] } ?? makeRow(tunnel) }
+        let added = next.filter { row in !rows.contains { $0 === row } }
+        removed.forEach { $0.controller.stop() }
+        rows = next
+        Log.write("config edited: kept \(kept.count), started \(added.count), stopped \(removed.count)")
+        do {
+            _ = try retireDuplicateAgents(for: added.map(\.controller.config))
+        } catch {
+            configError = "New SSH tunnels not started: \(error.localizedDescription)"
+            Log.write(configError ?? "")
+            added.forEach { $0.controller.stop() }
+            buildMenu()
+            refresh()
+            return
+        }
+        buildMenu()
+        refresh()
+        // A changed tunnel often keeps its ports, and the old ssh needs a
+        // moment to release them after SIGTERM. Starting at once would spend
+        // the first attempt on a port conflict.
+        let start = Timer(timeInterval: 1, repeats: false) { _ in
+            added.forEach { $0.controller.start() }
+        }
+        RunLoop.main.add(start, forMode: .common)
+    }
+
+    // MARK: Service checks
+
+    private func checkServices() {
+        for row in rows where row.controller.state == .up && !row.checking {
+            check(row)
+        }
+    }
+
+    private func check(_ row: TunnelRow) {
+        row.checking = true
+        let targets = row.checkedPorts
+        DispatchQueue.global(qos: .utility).async { [weak self, weak row] in
+            let results = targets.map { ($0.key, probeLocalService(port: $0.port)) }
+            DispatchQueue.main.async {
+                guard let row else { return }
+                row.checking = false
+                // A tunnel that dropped during the check has no services to report.
+                guard row.controller.state == .up else { return }
+                for (key, health) in results where row.health[key] != health {
+                    Log.write("\(row.name): \(key) \(health == .answering ? "answering" : "not answering")")
+                }
+                row.health = Dictionary(uniqueKeysWithValues: results)
+                self?.refresh()
+            }
+        }
+    }
+
+    // MARK: Network changes
+
+    // A new network makes the waiting tunnels' backoff meaningless. Only
+    // physical interfaces and gateways count, so a VPN or VM interface coming
+    // and going does not trigger a round of retries.
+    private func observeNetworkChanges() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let interfaces = path.availableInterfaces
+                .filter { $0.type == .wifi || $0.type == .wiredEthernet }
+                .map(\.name).sorted()
+            let gateways = path.gateways.map { "\($0)" }.sorted()
+            let usable = path.status == .satisfied
+            let signature = "\(usable) \(interfaces) \(gateways)"
+            DispatchQueue.main.async { self?.networkChanged(signature: signature, usable: usable) }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "app.pipedesk.network"))
+    }
+
+    private func networkChanged(signature: String, usable: Bool) {
+        defer { pathSignature = signature }
+        guard let previous = pathSignature, previous != signature, usable else { return }
+        Log.write("network changed")
+        rows.forEach { $0.controller.retryNowIfWaiting() }
+        rows.forEach { $0.health = [:] }
+        checkServices()
+        refresh()
     }
 
     // A tunnel that rides on a pipe cannot reach anything until that pipe
@@ -221,9 +401,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let summary = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         summary.tag = 110
         menu.addItem(summary)
-        let controls = NSMenuItem(title: "Stop tunnels and pipes separately", action: nil, keyEquivalent: "")
-        controls.toolTip = "Stopping an SSH tunnel keeps its transport pipe running. Stop the pipe from its own submenu."
-        menu.addItem(controls)
         menu.addItem(.separator())
 
         if let configError {
@@ -237,17 +414,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (index, row) in rows.enumerated() {
             if index > 0 { menu.addItem(.separator()) }
             menu.addItem(headerRow(for: row))
-            menu.addItem(.separator())
-            menu.addItem(sectionHeader("Connect To \(row.name)"))
+            row.linkRows = []
             for link in row.controller.config.links {
-                let item = action(link.label, detail: link.detail, symbol: link.symbol,
-                                  selector: #selector(openLink(_:)))
+                let view = MenuRowView(label: link.label, symbol: link.symbol, detail: link.detail,
+                                       dot: linkDot(link, health: row.health[link.url]))
+                let item = viewItem(view, title: link.label, selector: #selector(openLink(_:)))
                 item.representedObject = link.url
+                row.linkRows.append((link, view))
                 menu.addItem(item)
             }
             if let shell = row.controller.config.shellAlias {
-                let item = action("Copy Shell Command", detail: "ssh \(shell)",
-                                  symbol: "terminal", selector: #selector(copyShell(_:)))
+                let view = MenuRowView(label: "Copy Shell Command", symbol: "terminal", detail: "ssh \(shell)")
+                let item = viewItem(view, title: "Copy Shell Command", selector: #selector(copyShell(_:)))
                 item.representedObject = shell
                 menu.addItem(item)
             }
@@ -264,65 +442,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                action: #selector(toggleLoginItem), keyEquivalent: "")
         login.offStateImage = NSImage(size: NSSize(width: 12, height: 12))
         menu.addItem(login)
+        menu.addItem(.separator())
 
-        menu.addItem(NSMenuItem(title: "Add Pipe or Set Up Remote...", action: #selector(showSetup), keyEquivalent: "n"))
-        menu.addItem(NSMenuItem(title: "Choose Dumbpipe Executable...", action: #selector(chooseDumbpipe), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Import SSH Configuration...", action: #selector(importSSH), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Export for Android...", action: #selector(exportAndroid), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Open Logs", action: #selector(openLogs), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Get Patchpipe for Android (not made by PipeDesk)",
-                                action: #selector(openAndroidApp), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Edit SSH Configuration...",
-                                action: #selector(editConfig), keyEquivalent: ","))
+        // No key equivalents in this menu. A status menu reserves a column for
+        // them on every row, which leaves wide empty padding on the right, and
+        // they only work while the menu is already open.
+        menu.addItem(NSMenuItem(title: "Add Pipe or Set Up Remote...", action: #selector(showSetup), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Reload Configuration",
-                                action: #selector(reloadConfig), keyEquivalent: "r"))
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
+                                action: #selector(reloadConfig), keyEquivalent: ""))
+        menu.addItem(.separator())
+        addSettings(to: menu)
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit PipeDesk", action: #selector(quit), keyEquivalent: ""))
         for item in menu.items where item.action != nil { item.target = self }
         statusItem.menu = menu
     }
 
-    private func sectionHeader(_ title: String) -> NSMenuItem {
-        if #available(macOS 14.0, *) { return NSMenuItem.sectionHeader(title: title) }
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = false
-        return item
+    // Set-once and rarely used items, under their own heading at the bottom so
+    // the remotes and their links are what the eye finds first. They are not
+    // a submenu: a submenu arrow makes the menu reserve an empty column on the
+    // right of every row.
+    private func addSettings(to menu: NSMenu) {
+        menu.addItem(heading("Settings"))
+        menu.addItem(NSMenuItem(title: "Edit SSH Configuration...", action: #selector(editConfig), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Import SSH Configuration...", action: #selector(importSSH), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Choose Dumbpipe Executable...", action: #selector(chooseDumbpipe), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Export for Android...", action: #selector(exportAndroid), keyEquivalent: ""))
+        let patchpipe = MenuRowView(label: "Get Patchpipe for Android", symbol: nil, detail: "not made by PipeDesk")
+        menu.addItem(viewItem(patchpipe, title: "Get Patchpipe for Android", selector: #selector(openAndroidApp)))
+        menu.addItem(NSMenuItem(title: "Open Logs", action: #selector(openLogs), keyEquivalent: ""))
     }
 
-    private func action(_ title: String, detail: String, symbol: String,
-                        selector: Selector) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
-        item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+
+    // A label on the left, then grey detail and an optional status dot in one
+    // right-aligned column, so the addresses and dots line up down the menu.
+    // Tab stops count from where the item's text starts: after the icon for
+    // items that have one, at the plain text column for the rest.
+    private func columnTitle(_ label: String, detail: String, dot: NSColor? = nil,
+                             textStart: CGFloat = MenuGrid.iconTextStart) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.tabStops = [NSTextTab(textAlignment: .right, location: MenuGrid.rightEdge - textStart)]
         let text = NSMutableAttributedString(
-            string: title,
-            attributes: [.font: NSFont.menuFont(ofSize: 14)])
+            string: label,
+            attributes: [.font: MenuGrid.labelFont, .paragraphStyle: paragraph])
         text.append(NSAttributedString(
-            string: "   \(detail)",
-            attributes: [.font: NSFont.menuFont(ofSize: 11),
-                         .foregroundColor: NSColor.secondaryLabelColor]))
-        item.attributedTitle = text
+            string: "\t\(detail)",
+            attributes: [.font: MenuGrid.detailFont,
+                         .foregroundColor: NSColor.secondaryLabelColor,
+                         .paragraphStyle: paragraph]))
+        guard let dot else { return text }
+        text.append(NSAttributedString(
+            string: "  ●",
+            attributes: [.font: NSFont.menuFont(ofSize: 10), .foregroundColor: dot,
+                         .paragraphStyle: paragraph]))
+        return text
+    }
+
+    // A link's dot is green when its service answered the last check, grey
+    // when it did not or has not been checked. A link to another host has no dot.
+    private func linkDot(_ link: Link, health: ServiceHealth?) -> NSColor? {
+        guard link.localPort != nil else { return nil }
+        return health == .answering ? .systemGreen : .tertiaryLabelColor
+    }
+
+    private func viewItem(_ view: MenuRowView, title: String, selector: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+        item.target = self
+        item.view = view
         return item
     }
 
     // Title row: name, live status, and the switch that drives this tunnel.
     private func headerRow(for row: TunnelRow) -> NSMenuItem {
-        let width: CGFloat = 290
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 46))
+        // Every frame is fixed from the left, because the grid is measured
+        // from the menu's left edge and the menu may grow wider than this view.
+        let height: CGFloat = 40
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: MenuGrid.menuWidth, height: height))
         container.autoresizingMask = [.width]
+        let switchSize = row.toggleSwitch.intrinsicContentSize
+        let textWidth = MenuGrid.rightEdge - switchSize.width - 8 - MenuGrid.textStart
 
-        let title = NSTextField(labelWithString: "\(row.name) Tunnel")
-        title.font = .systemFont(ofSize: 14, weight: .semibold)
-        title.frame = NSRect(x: 14, y: 24, width: 180, height: 18)
-        title.autoresizingMask = [.maxXMargin]
+        let title = NSTextField(labelWithString: row.name)
+        title.font = .systemFont(ofSize: MenuGrid.labelFont.pointSize, weight: .semibold)
+        title.frame = NSRect(x: MenuGrid.textStart, y: 20, width: textWidth, height: 16)
         container.addSubview(title)
 
-        row.statusLabel.font = .systemFont(ofSize: 11)
+        row.statusLabel.font = MenuGrid.detailFont
         row.statusLabel.textColor = .secondaryLabelColor
-        row.statusLabel.frame = NSRect(x: 14, y: 7, width: 180, height: 14)
-        row.statusLabel.autoresizingMask = [.maxXMargin]
+        row.statusLabel.lineBreakMode = .byTruncatingTail
+        row.statusLabel.frame = NSRect(x: MenuGrid.textStart, y: 5, width: textWidth, height: 14)
         container.addSubview(row.statusLabel)
 
-        row.toggleSwitch.frame = NSRect(x: width - 56, y: 11, width: 42, height: 24)
-        row.toggleSwitch.autoresizingMask = [.minXMargin]
+        row.toggleSwitch.frame = NSRect(x: MenuGrid.rightEdge - switchSize.width,
+                                        y: (height - switchSize.height) / 2,
+                                        width: switchSize.width, height: switchSize.height)
         row.toggleSwitch.onToggle = { [weak self, weak row] in
             guard let row else { return }
             if row.toggleSwitch.isOn { row.controller.start() } else { row.controller.stop() }
@@ -342,11 +555,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (row, state) in zip(rows, states) {
             row.controller.noteState(state)
             if state == .up { row.controller.noteHealthy() }
+            noteTransition(row, to: state)
             row.statusLabel.stringValue = statusText(for: row, state: state)
-            row.statusLabel.textColor = (state == .down && row.controller.lastError != nil)
-                ? .systemRed : .secondaryLabelColor
+            row.statusLabel.textColor = statusColor(for: row, state: state)
             row.statusLabel.toolTip = row.controller.lastError
             row.toggleSwitch.isOn = row.controller.wantsConnection
+            for (link, view) in row.linkRows {
+                view.dot = linkDot(link, health: row.health[link.url])
+            }
         }
 
         let unhealthy = pipes.filter(\.unhealthy).count
@@ -368,23 +584,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             SMAppService.mainApp.status == .enabled ? .on : .off
     }
 
+    // Old answers describe a tunnel that no longer exists, so they go when it
+    // drops. A tunnel that just came up gets checked at once rather than wait
+    // for the next 30 second round.
+    private func noteTransition(_ row: TunnelRow, to state: TunnelState) {
+        defer { row.lastState = state }
+        guard state != row.lastState else { return }
+        if state != .up { row.health = [:] }
+        if state == .up, !row.checking { check(row) }
+    }
+
     // "Disconnected" alone hides a misconfigured remote. Show ssh's own reason
     // and when the next attempt happens.
     private func statusText(for row: TunnelRow, state: TunnelState) -> String {
-        if state != .down || !row.controller.wantsConnection { return row.controller.status }
-        let reason = row.controller.lastError.map(shorten) ?? row.controller.status
-        if let next = row.controller.nextRetry {
-            let seconds = max(0, Int(next.timeIntervalSinceNow.rounded()))
-            return "\(reason)  - retry in \(seconds)s"
-        }
-        return reason
+        let retry = row.controller.nextRetry.map { max(0, Int($0.timeIntervalSinceNow.rounded())) }
+        return tunnelStatusText(wantsConnection: row.controller.wantsConnection, state: state,
+                                lastError: row.controller.lastError, retryInSeconds: retry,
+                                silentLinks: row.silentLinks, servicesChecked: row.servicesChecked)
     }
 
-    private func shorten(_ message: String) -> String {
-        let cleaned = message
-            .replacingOccurrences(of: "ssh: ", with: "")
-            .replacingOccurrences(of: "Warning: ", with: "")
-        return cleaned.count > 48 ? String(cleaned.prefix(48)) + "..." : cleaned
+    private func statusColor(for row: TunnelRow, state: TunnelState) -> NSColor {
+        guard row.controller.wantsConnection else { return .secondaryLabelColor }
+        if state == .down && row.controller.lastError != nil { return .systemRed }
+        if state == .up && !row.silentLinks.isEmpty { return .systemOrange }
+        if state == .up && row.servicesChecked { return .systemGreen }
+        return .secondaryLabelColor
     }
 
     private func acquireInstanceLock() -> Bool {
@@ -431,46 +655,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupWindow?.showWindow(nil)
     }
 
+    // Pipes sit under their own heading, apart from the SSH remotes, because a
+    // pipe is a transport and not a place to open. Each pipe's row shows its
+    // address and a status dot, so the submenu is only needed to act on it.
     private func addPipeMenu(to menu: NSMenu) {
+        if !pipes.isEmpty { menu.addItem(heading("Dumbpipe Pipes")) }
         for pipe in pipes {
             let parent = NSMenuItem(title: pipe.profile.name, action: nil, keyEquivalent: "")
             parent.representedObject = pipe.profile.id
-            let submenu = NSMenu()
-            submenu.autoenablesItems = false
-            let status = NSMenuItem(title: pipe.status, action: nil, keyEquivalent: "")
-            status.tag = 101
-            submenu.addItem(status)
-            let lastError = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-            lastError.tag = 104
-            lastError.isHidden = true
-            submenu.addItem(lastError)
-            let toggle = NSMenuItem(title: "Start", action: #selector(togglePipe(_:)), keyEquivalent: "")
-            toggle.tag = 102
-            toggle.representedObject = pipe.profile.id
-            toggle.target = self
-            submenu.addItem(toggle)
-            let atLaunch = NSMenuItem(title: "Start at Launch", action: #selector(togglePipeAtLaunch(_:)),
-                                      keyEquivalent: "")
-            atLaunch.tag = 105
-            atLaunch.representedObject = pipe.profile.id
-            atLaunch.target = self
-            submenu.addItem(atLaunch)
-            let copy = NSMenuItem(title: pipe.profile.mode == .share ? "Copy Ticket" : "Copy Local Address",
-                                  action: #selector(copyPipe(_:)), keyEquivalent: "")
-            copy.tag = 103
-            copy.representedObject = pipe.profile.id
-            copy.target = self
-            submenu.addItem(copy)
-            let rename = NSMenuItem(title: "Rename...", action: #selector(renamePipe(_:)), keyEquivalent: "")
-            rename.representedObject = pipe.profile.id
-            rename.target = self
-            submenu.addItem(rename)
-            submenu.addItem(.separator())
-            let remove = NSMenuItem(title: "Remove Profile...", action: #selector(removePipe(_:)), keyEquivalent: "")
-            remove.representedObject = pipe.profile.id
-            remove.target = self
-            submenu.addItem(remove)
-            parent.submenu = submenu
+            parent.image = NSImage(systemSymbolName: "arrow.left.arrow.right",
+                                   accessibilityDescription: pipe.profile.name)
+            parent.submenu = pipeSubmenu(for: pipe)
             menu.addItem(parent)
         }
         if !pipes.isEmpty { menu.addItem(.separator()) }
@@ -479,15 +674,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // What the pipe does, how it is right now, then what you can do with it.
+    // Information lines are disabled so they read as text, not as commands.
+    private func pipeSubmenu(for pipe: PipeController) -> NSMenu {
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+        let address = "127.0.0.1:\(pipe.profile.port)"
+        let purpose = pipe.profile.mode == .connect
+            ? "Forwards \(address) to the remote in its ticket"
+            : "Shares \(address) with anyone who holds its ticket"
+        submenu.addItem(note(purpose))
+        submenu.addItem(note("", tag: 101))
+        let lastError = note("", tag: 104)
+        lastError.isHidden = true
+        submenu.addItem(lastError)
+        submenu.addItem(.separator())
+        submenu.addItem(pipeCommand("Start Pipe", #selector(togglePipe(_:)), pipe, tag: 102))
+        submenu.addItem(pipeCommand("Start When PipeDesk Opens", #selector(togglePipeAtLaunch(_:)), pipe, tag: 105))
+        submenu.addItem(.separator())
+        submenu.addItem(pipeCommand(pipe.profile.mode == .share ? "Copy Ticket" : "Copy Address \(address)",
+                                    #selector(copyPipe(_:)), pipe, tag: 103))
+        submenu.addItem(pipeCommand("Rename Pipe...", #selector(renamePipe(_:)), pipe))
+        submenu.addItem(.separator())
+        submenu.addItem(pipeCommand("Remove Pipe...", #selector(removePipe(_:)), pipe))
+        return submenu
+    }
+
+    private func note(_ title: String, tag: Int = 0) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        item.tag = tag
+        return item
+    }
+
+    private func pipeCommand(_ title: String, _ selector: Selector, _ pipe: PipeController,
+                             tag: Int = 0) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+        item.representedObject = pipe.profile.id
+        item.target = self
+        item.tag = tag
+        return item
+    }
+
+    private func heading(_ title: String) -> NSMenuItem {
+        if #available(macOS 14.0, *) { return NSMenuItem.sectionHeader(title: title) }
+        return note(title)
+    }
+
+    private func pipeDot(_ pipe: PipeController) -> NSColor {
+        if pipe.ready { return pipe.unhealthy ? .systemOrange : .systemGreen }
+        if pipe.wantsConnection && pipe.lastError != nil { return .systemRed }
+        return .tertiaryLabelColor
+    }
+
     private func updatePipeMenu() {
         for item in statusItem.menu?.items ?? [] {
             guard let identifier = item.representedObject as? UUID,
                   let pipe = pipes.first(where: { $0.profile.id == identifier }) else { continue }
-            item.state = pipe.ready && !pipe.unhealthy ? .on : .off
-            item.submenu?.item(withTag: 101)?.title = pipe.status
+            let detail = pipe.profile.mode == .share ? "sharing port \(pipe.profile.port)"
+                                                     : "127.0.0.1:\(pipe.profile.port)"
+            item.attributedTitle = columnTitle(pipe.profile.name, detail: detail, dot: pipeDot(pipe))
+            item.submenu?.item(withTag: 101)?.title = "Status: \(pipe.status)"
             item.submenu?.item(withTag: 104)?.title = "Last error: \(pipe.lastError ?? "")"
             item.submenu?.item(withTag: 104)?.isHidden = pipe.lastError == nil
-            item.submenu?.item(withTag: 102)?.title = pipe.wantsConnection ? "Stop" : "Start"
+            item.submenu?.item(withTag: 102)?.title = pipe.wantsConnection ? "Stop Pipe" : "Start Pipe"
             item.submenu?.item(withTag: 103)?.isEnabled = pipe.profile.mode == .connect || pipe.ticket != nil
             item.submenu?.item(withTag: 105)?.state = pipe.profile.autoStarts ? .on : .off
         }

@@ -37,9 +37,52 @@ for override in ["HostName=other.invalid", "Port=2200", "ProxyJump=other", "Remo
     precondition(LegacyTunnelAgent(propertyList: distinctTunnel, aliases: ["example"]) == nil,
                  "A distinct tunnel matched: \(override)")
 }
+// Status wording. "Connected" must mean the service answered, not only that
+// ssh holds the local port.
+precondition(tunnelStatusText(wantsConnection: false, state: .down, lastError: "boom",
+                              retryInSeconds: 5, silentLinks: [], servicesChecked: false) == "Off",
+             "A switched-off tunnel reported a failure")
+precondition(tunnelStatusText(wantsConnection: true, state: .up, lastError: nil,
+                              retryInSeconds: nil, silentLinks: [], servicesChecked: true) == "Connected",
+             "A healthy tunnel did not read as connected")
+precondition(tunnelStatusText(wantsConnection: true, state: .up, lastError: nil, retryInSeconds: nil,
+                              silentLinks: ["Rhapsody", "Open Imagine"], servicesChecked: true)
+             == "Tunnel up, Rhapsody, Open Imagine not responding",
+             "A dead service behind a live tunnel read as connected")
+precondition(tunnelStatusText(wantsConnection: true, state: .up, lastError: nil,
+                              retryInSeconds: nil, silentLinks: [], servicesChecked: false)
+             == "Tunnel up, checking services...", "An unchecked tunnel claimed its services")
+precondition(tunnelStatusText(wantsConnection: true, state: .down, lastError: "ssh: Connection refused",
+                              retryInSeconds: 12, silentLinks: [], servicesChecked: false)
+             == "Retrying in 12s: Connection refused", "A retrying tunnel hid its reason or its timer")
+precondition(tunnelStatusText(wantsConnection: true, state: .down, lastError: nil,
+                              retryInSeconds: nil, silentLinks: [], servicesChecked: false) == "Not connected",
+             "A down tunnel with no reason read wrong")
+
+precondition(isRefusedForward("channel 6: open failed: connect failed: Connection refused"),
+             "A refused forward was not recognised")
+precondition(!isRefusedForward("kex_exchange_identification: read: Connection reset by peer"),
+             "A connection failure was hidden as a refused forward")
+
+// A link reaches its service only through a local port.
+precondition(Link(label: "Web", url: "http://localhost:7427").localPort == 7427, "Missed an explicit port")
+precondition(Link(label: "Screen", url: "vnc://localhost").localPort == 5900, "Missed the VNC default port")
+precondition(Link(label: "Remote", url: "https://example.com:8443").localPort == nil,
+             "A remote link was treated as local")
+
+// A config edit restarts only the tunnels it changed.
+func tunnel(_ name: String, port: UInt16) -> TunnelConfig {
+    TunnelConfig(name: name, tunnelAlias: name.lowercased(), shellAlias: nil, probePort: port,
+                 links: [], controlPath: nil, restartAgent: nil)
+}
+let before = [tunnel("Office", port: 7427), tunnel("Avery", port: 7428), tunnel("Spark", port: 8766)]
+let after = [tunnel("Spark", port: 8766), tunnel("Office", port: 9000), tunnel("Avery", port: 7428)]
+precondition(matchTunnels(current: before, next: after) == [2, nil, 1],
+             "Reload restarted an unchanged tunnel or kept a changed one")
+
 let stoppedTunnel = TunnelController(config: config.tunnels[0])
 stoppedTunnel.stop()
-precondition(stoppedTunnel.status == "Stopped", "A stopped tunnel reported a connection failure")
+precondition(!stoppedTunnel.wantsConnection, "A stopped tunnel still wanted a connection")
 precondition(connectionSummary(tunnels: 0, pipes: 1, unhealthy: 0)
              == "Tunnels running: 0, pipes running: 1", "A running pipe disappeared from the summary")
 precondition(connectionSummary(tunnels: 1, pipes: 1, unhealthy: 1)
@@ -114,6 +157,38 @@ precondition(stranded.established == 0, "A stranded socket still counted as live
 precondition(residentBytes(pid: getpid()) > 0, "Resident size read back as zero")
 close(accepted)
 close(listener)
+
+// The service check, against the three shapes a forwarded port can take.
+// ssh accepts locally and then closes at once when the remote refuses. A live
+// service keeps the connection open, or greets first.
+func serve(_ behaviour: @escaping (Int32) -> Void) -> UInt16 {
+    let server = socket(AF_INET, SOCK_STREAM, 0)
+    var any = loopbackAddress(port: 0)
+    precondition(withAddress(&any) { bind(server, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } == 0)
+    precondition(listen(server, 4) == 0)
+    var bound = sockaddr_in()
+    var boundLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+    _ = withUnsafeMutablePointer(to: &bound) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(server, $0, &boundLength) }
+    }
+    Thread.detachNewThread {
+        let connection = accept(server, nil, nil)
+        behaviour(connection)
+        close(server)
+    }
+    return UInt16(bigEndian: bound.sin_port)
+}
+let silentPort = serve { connection in sleep(3); close(connection) }
+precondition(probeLocalService(port: silentPort, wait: 1) == .answering,
+             "A service that waits for the client read as down")
+let greetingPort = serve { connection in _ = "RFB 003.889\n".withCString { write(connection, $0, 12) }; sleep(2); close(connection) }
+precondition(probeLocalService(port: greetingPort, wait: 1) == .answering,
+             "A service that greets read as down")
+let refusedPort = serve { connection in close(connection) }
+precondition(probeLocalService(port: refusedPort, wait: 1) == .notAnswering,
+             "A forward whose remote refused read as answering")
+precondition(probeLocalService(port: testPort, wait: 1) == .notAnswering,
+             "A closed port read as answering")
 
 print("SSH import and socket cleanup checks passed")
 

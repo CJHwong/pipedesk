@@ -45,9 +45,23 @@ enum Log {
 
 // MARK: - Configuration
 
-struct Link: Codable {
+struct Link: Codable, Equatable {
     let label: String
     let url: String
+
+    // The local port a link reaches its service through. A link to another
+    // host does not go through the tunnel, so it has nothing to check here.
+    var localPort: UInt16? {
+        guard let parsed = URL(string: url), let host = parsed.host,
+              ["localhost", "127.0.0.1", "::1"].contains(host) else { return nil }
+        if let port = parsed.port { return UInt16(exactly: port) }
+        switch parsed.scheme {
+        case "vnc": return 5900
+        case "http": return 80
+        case "https": return 443
+        default: return nil
+        }
+    }
 
     // Shown under the label in the menu. "http://localhost:7427" reads better
     // as "localhost:7427", and a scheme alone is not worth a line of its own.
@@ -66,7 +80,7 @@ struct Link: Codable {
     }
 }
 
-struct TunnelConfig: Codable {
+struct TunnelConfig: Codable, Equatable {
     let name: String
     let tunnelAlias: String
     let shellAlias: String?
@@ -125,6 +139,92 @@ struct Config: Codable {
         return config
     }
 
+}
+
+// For each tunnel in the new config, the index of an identical running tunnel
+// to keep, or nil when it is new or changed. An edit to one tunnel must not
+// drop the sessions running through all the others.
+func matchTunnels(current: [TunnelConfig], next: [TunnelConfig]) -> [Int?] {
+    var unused = Set(current.indices)
+    return next.map { tunnel in
+        guard let index = current.indices.first(where: { unused.contains($0) && current[$0] == tunnel })
+        else { return nil }
+        unused.remove(index)
+        return index
+    }
+}
+
+// MARK: - Service check
+
+enum ServiceHealth {
+    case answering, notAnswering
+}
+
+// Whether the service behind a forwarded port answers.
+//
+// ssh accepts a forwarded connection locally before it asks the remote side to
+// open its end. When nothing listens there, the remote refuses and ssh closes
+// the local socket within a round trip. A live service keeps the connection
+// open, or sends its greeting first. So the first moments of one connection
+// separate the two. This is a separate signal from processListens, which
+// proves only that the tunnel itself holds the port.
+func probeLocalService(port: UInt16, wait: TimeInterval = 2) -> ServiceHealth {
+    let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+    guard descriptor >= 0 else { return .notAnswering }
+    defer { close(descriptor) }
+    var noSignal: Int32 = 1
+    setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_addr.s_addr = inet_addr("127.0.0.1")
+    address.sin_port = port.bigEndian
+    let connected = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    guard connected == 0 else { return .notAnswering }
+    var watch = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+    let ready = poll(&watch, 1, Int32(wait * 1000))
+    if ready == 0 { return .answering }
+    guard ready > 0 else { return .notAnswering }
+    var first: UInt8 = 0
+    return recv(descriptor, &first, 1, MSG_PEEK) > 0 ? .answering : .notAnswering
+}
+
+// MARK: - Status text
+
+// One line per remote. "Connected" means every checked service answered, not
+// only that ssh holds the local port.
+func tunnelStatusText(wantsConnection: Bool, state: TunnelState, lastError: String?,
+                      retryInSeconds: Int?, silentLinks: [String], servicesChecked: Bool) -> String {
+    guard wantsConnection else { return "Off" }
+    switch state {
+    case .starting:
+        return "Connecting..."
+    case .up:
+        if !servicesChecked { return "Tunnel up, checking services..." }
+        if silentLinks.isEmpty { return "Connected" }
+        return "Tunnel up, \(silentLinks.joined(separator: ", ")) not responding"
+    case .down:
+        let reason = lastError.map(shortenSSHError) ?? "Not connected"
+        guard let seconds = retryInSeconds else { return reason }
+        return "Retrying in \(seconds)s: \(reason)"
+    }
+}
+
+// ssh's report when the remote end of one forwarded connection refuses, as in
+// "channel 6: open failed: connect failed: Connection refused".
+func isRefusedForward(_ line: String) -> Bool {
+    line.hasPrefix("channel ") && line.contains(": open failed: ")
+}
+
+func shortenSSHError(_ message: String) -> String {
+    let cleaned = message
+        .replacingOccurrences(of: "ssh: ", with: "")
+        .replacingOccurrences(of: "Warning: ", with: "")
+    return cleaned.count > 48 ? String(cleaned.prefix(48)) + "..." : cleaned
 }
 
 // MARK: - State
@@ -292,12 +392,6 @@ final class TunnelController {
 
     var isRunning: Bool { task?.isRunning ?? false }
 
-    var status: String {
-        if !userWantsTunnel { return "Stopped" }
-        if state == .up { return "Forwarding locally" }
-        return state.label
-    }
-
     func start() {
         userWantsTunnel = true
         suspendedForSleep = false
@@ -376,7 +470,10 @@ final class TunnelController {
         // The menu has room for one line, but the log keeps every line.
         // ssh reports the cause first and the summary last, so dropping
         // the earlier lines would throw away the useful half.
-        lines.forEach { Log.write("\(config.name): ssh: \($0)") }
+        // The exception is a refused forward: each service check of a dead
+        // service produces one, twice a minute. The check already logs when
+        // a service starts or stops answering, so the repeats only bury events.
+        lines.filter { !isRefusedForward($0) }.forEach { Log.write("\(config.name): ssh: \($0)") }
         guard let line = lines.last else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self, self.userWantsTunnel else { return }
@@ -438,6 +535,20 @@ final class TunnelController {
         failureCount = 0
         lastError = nil
         Log.write("\(config.name): resuming after wake")
+        start()
+    }
+
+    // A new network makes the old failures meaningless, the same as wake does.
+    // Only a tunnel sitting out a backoff is touched. A running ssh keeps its
+    // session, because restarting on every path update would churn tunnels
+    // each time a virtual interface comes or goes.
+    func retryNowIfWaiting() {
+        guard userWantsTunnel, !isRunning, nextRetry != nil else { return }
+        cancelRetry()
+        nextRetry = nil
+        failureCount = 0
+        lastError = nil
+        Log.write("\(config.name): network changed, retrying now")
         start()
     }
 

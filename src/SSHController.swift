@@ -1,6 +1,8 @@
 import AppKit
 
 let sshPath = "/usr/bin/ssh"
+// The port of the PAC file PipeDesk serves for the system proxy setting.
+let pacPort: UInt16 = 1079
 
 // MARK: - Log
 
@@ -106,6 +108,13 @@ struct TunnelConfig: Codable, Equatable {
     // recover, which looks exactly like a broken tunnel. Restart it at launch
     // rather than let the tunnel fail and back off against a corpse.
     let restartAgent: String?
+    // A SOCKS port, for a bastion that may only reach listed hosts. A single
+    // -L forward cannot serve a web app that redirects to its own host, so the
+    // browser goes through this port and the bastion resolves each host.
+    let socksPort: UInt16?
+    // The name of another tunnel this one starts after. A jump that shares
+    // that tunnel's ssh connection must not start first, or it opens its own.
+    let after: String?
 
     var expandedControlPath: String? {
         controlPath.map { ($0 as NSString).expandingTildeInPath }
@@ -120,9 +129,26 @@ struct TunnelConfig: Codable, Equatable {
             // The forwards live here rather than in the ssh config, so a link
             // and its forward cannot drift apart. ssh drops a forward that
             // repeats one from the config, so an old config still works.
+            + (socksPort.map { ["-D", "127.0.0.1:\($0)"] } ?? [])
             + links.compactMap(\.forward).flatMap { ["-L", $0] }
             + ["--", tunnelAlias]
     }
+
+    // Where a link goes through the SOCKS port: a web link to a host other
+    // than this Mac. Other links keep their own forward, or open directly.
+    func proxiedTarget(of link: Link) -> ProxiedTarget? {
+        guard socksPort != nil, link.localPort == nil,
+              let parsed = URL(string: link.url), let host = parsed.host else { return nil }
+        let defaultPort: UInt16
+        switch parsed.scheme {
+        case "https": defaultPort = 443
+        case "http": defaultPort = 80
+        default: return nil
+        }
+        guard let port = parsed.port.map({ UInt16(exactly: $0) }) ?? defaultPort else { return nil }
+        return ProxiedTarget(host: host, port: port)
+    }
+
 
 }
 
@@ -156,9 +182,85 @@ struct Config: Codable {
                 }
             }
         }
+        try checkSOCKSPorts(config.tunnels)
+        try checkStartOrder(config.tunnels)
         return config
     }
 
+}
+
+// Each SOCKS port is a listener of its own, so it must not repeat across
+// tunnels, match any link's local port, or take the PAC port. Otherwise one
+// ssh fails to bind and its tunnel retries forever.
+private func checkSOCKSPorts(_ tunnels: [TunnelConfig]) throws {
+    let linkPorts = tunnels.flatMap { $0.links.compactMap(\.localPort) }
+    var socksPorts = Set<UInt16>()
+    for tunnel in tunnels {
+        guard let socks = tunnel.socksPort else { continue }
+        guard socks > 0, socks != pacPort, !linkPorts.contains(socks), socksPorts.insert(socks).inserted else {
+            throw PipeError.invalid("\(tunnel.name): socksPort \(socks) needs a port from 1 to 65535 that no other "
+                + "socksPort or link uses, and not \(pacPort), which serves the proxy file.")
+        }
+    }
+}
+
+// A tunnel waits for one other tunnel, and that one waits for none. One level
+// covers a jump host, and no chain of waits can loop back on itself.
+private func checkStartOrder(_ tunnels: [TunnelConfig]) throws {
+    for tunnel in tunnels {
+        guard let after = tunnel.after else { continue }
+        guard after != tunnel.name, let target = tunnels.first(where: { $0.name == after }), target.after == nil else {
+            throw PipeError.invalid("\(tunnel.name): after must name another tunnel, one that has no after of its own.")
+        }
+    }
+}
+
+struct ProxiedTarget: Equatable {
+    let host: String
+    let port: UInt16
+}
+
+// MARK: - Orphans
+
+// A PipeDesk killed outright (SIGKILL, a crash) cannot stop its ssh children.
+// They move under launchd and keep their forwarded ports, so every tunnel of
+// the next launch fails with "Address already in use". These are the ones to
+// stop: parent 1 and exactly the command line PipeDesk builds for a tunnel.
+// `processList` is `ps -axo pid=,ppid=,args=`.
+func orphanedTunnelPIDs(processList: String, tunnels: [TunnelConfig]) -> [pid_t] {
+    let ours = Set(tunnels.map { ([sshPath] + $0.sshArguments).joined(separator: " ") })
+    return processList.split(separator: "\n").compactMap { line in
+        let fields = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+        guard fields.count == 3, let pid = pid_t(fields[0]), fields[1] == "1",
+              ours.contains(String(fields[2])) else { return nil }
+        return pid
+    }
+}
+
+// Stops the orphans and waits for their ports to free, up to two seconds,
+// then kills any that ignored SIGTERM.
+func stopOrphanedTunnels(for tunnels: [TunnelConfig]) {
+    let process = Process()
+    let output = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/ps")
+    process.arguments = ["-axo", "pid=,ppid=,args="]
+    process.standardOutput = output
+    do { try process.run() } catch {
+        Log.write("cannot list processes to find orphaned tunnels: \(error.localizedDescription)")
+        return
+    }
+    let list = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    process.waitUntilExit()
+    let orphans = orphanedTunnelPIDs(processList: list, tunnels: tunnels)
+    guard !orphans.isEmpty else { return }
+    Log.write("stopping \(orphans.count) ssh tunnel(s) left by an earlier PipeDesk: \(orphans)")
+    orphans.forEach { kill($0, SIGTERM) }
+    let deadline = Date().addingTimeInterval(2)
+    while Date() < deadline, orphans.contains(where: { kill($0, 0) == 0 }) { usleep(100_000) }
+    for pid in orphans where kill(pid, 0) == 0 {
+        Log.write("ssh \(pid) ignored SIGTERM, killing it")
+        kill(pid, SIGKILL)
+    }
 }
 
 // For each tunnel in the new config, the index of an identical running tunnel
@@ -189,9 +291,44 @@ enum ServiceHealth {
 // separate the two. This is a separate signal from processListens, which
 // proves only that the tunnel itself holds the port.
 func probeLocalService(port: UInt16, wait: TimeInterval = 2) -> ServiceHealth {
-    let descriptor = socket(AF_INET, SOCK_STREAM, 0)
-    guard descriptor >= 0 else { return .notAnswering }
+    guard let descriptor = connectLoopback(port: port) else { return .notAnswering }
     defer { close(descriptor) }
+    return awaitService(descriptor, wait: wait)
+}
+
+// Whether a destination answers through a SOCKS tunnel.
+//
+// OpenSSH replies to a SOCKS request only after the bastion opened its end,
+// and closes without a reply when the bastion refuses, as permitopen does for
+// an unlisted host. A success reply is not enough on its own: the destination
+// can still close at once, so the same wait as a forwarded port follows.
+func probeThroughSOCKS(socksPort: UInt16, host: String, port: UInt16, wait: TimeInterval = 2) -> ServiceHealth {
+    let name = Array(host.utf8)
+    guard name.count <= 255, let descriptor = connectLoopback(port: socksPort) else { return .notAnswering }
+    defer { close(descriptor) }
+    var timeout = timeval(tv_sec: Int(wait.rounded(.up)), tv_usec: 0)
+    setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+    // No authentication: the tunnel is already the user's own ssh session.
+    guard sendAll(descriptor, [5, 1, 0]), receive(descriptor, count: 2) == [5, 0] else { return .notAnswering }
+    let request: [UInt8] = [5, 1, 0, 3, UInt8(name.count)] + name + [UInt8(port >> 8), UInt8(port & 0xff)]
+    guard sendAll(descriptor, request),
+          let head = receive(descriptor, count: 4), head[0] == 5, head[1] == 0 else { return .notAnswering }
+    let addressLength: Int
+    switch head[3] {
+    case 1: addressLength = 4
+    case 4: addressLength = 16
+    case 3:
+        guard let length = receive(descriptor, count: 1) else { return .notAnswering }
+        addressLength = Int(length[0])
+    default: return .notAnswering
+    }
+    guard receive(descriptor, count: addressLength + 2) != nil else { return .notAnswering }
+    return awaitService(descriptor, wait: wait)
+}
+
+private func connectLoopback(port: UInt16) -> Int32? {
+    let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+    guard descriptor >= 0 else { return nil }
     var noSignal: Int32 = 1
     setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size))
     var address = sockaddr_in()
@@ -204,7 +341,13 @@ func probeLocalService(port: UInt16, wait: TimeInterval = 2) -> ServiceHealth {
             connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
         }
     }
-    guard connected == 0 else { return .notAnswering }
+    guard connected == 0 else { close(descriptor); return nil }
+    return descriptor
+}
+
+// A connection that stays open, or sends data first, has a live service
+// behind it. One that closes within the wait was refused at the far end.
+private func awaitService(_ descriptor: Int32, wait: TimeInterval) -> ServiceHealth {
     var watch = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
     let ready = poll(&watch, 1, Int32(wait * 1000))
     if ready == 0 { return .answering }
@@ -213,13 +356,31 @@ func probeLocalService(port: UInt16, wait: TimeInterval = 2) -> ServiceHealth {
     return recv(descriptor, &first, 1, MSG_PEEK) > 0 ? .answering : .notAnswering
 }
 
+private func sendAll(_ descriptor: Int32, _ bytes: [UInt8]) -> Bool {
+    bytes.withUnsafeBytes { send(descriptor, $0.baseAddress, bytes.count, 0) } == bytes.count
+}
+
+// Exactly `count` bytes, or nil when the peer closes or the timeout passes.
+private func receive(_ descriptor: Int32, count: Int) -> [UInt8]? {
+    var bytes = [UInt8](repeating: 0, count: count)
+    var filled = 0
+    while filled < count {
+        let got = bytes.withUnsafeMutableBytes { recv(descriptor, $0.baseAddress! + filled, count - filled, 0) }
+        guard got > 0 else { return nil }
+        filled += got
+    }
+    return bytes
+}
+
 // MARK: - Status text
 
 // One line per remote. "Connected" means every checked service answered, not
 // only that ssh holds the local port.
 func tunnelStatusText(wantsConnection: Bool, state: TunnelState, lastError: String?,
-                      retryInSeconds: Int?, silentLinks: [String], servicesChecked: Bool) -> String {
+                      retryInSeconds: Int?, silentLinks: [String], servicesChecked: Bool,
+                      waitingFor: String? = nil) -> String {
     guard wantsConnection else { return "Off" }
+    if let waitingFor { return "Waiting for \(waitingFor)" }
     switch state {
     case .starting:
         return "Connecting..."
@@ -399,6 +560,9 @@ final class TunnelController {
     private var userWantsTunnel = true
     private var suspendedForSleep = false
     var onStateChange: (() -> Void)?
+    // Set for a tunnel with `after`. Answers whether that tunnel is up.
+    var dependencyUp: () -> Bool = { true }
+    private(set) var waitingFor: String?
 
     init(config: TunnelConfig) {
         self.config = config
@@ -416,6 +580,13 @@ final class TunnelController {
         userWantsTunnel = true
         suspendedForSleep = false
         guard !isRunning else { return }
+        if let after = config.after, !dependencyUp() {
+            if waitingFor == nil { Log.write("\(config.name): waiting for \(after)") }
+            waitingFor = after
+            onStateChange?()
+            return
+        }
+        waitingFor = nil
         clearStaleControlSocket(config.expandedControlPath)
         Log.write("\(config.name): starting ssh \(config.tunnelAlias), attempt \(failureCount + 1)")
         let process = Process()
@@ -450,8 +621,16 @@ final class TunnelController {
         onStateChange?()
     }
 
+    // Called on every refresh. A tunnel parked in start() goes once the tunnel
+    // it waits for is up.
+    func startIfDependencyUp() {
+        guard waitingFor != nil, userWantsTunnel, !suspendedForSleep, dependencyUp() else { return }
+        start()
+    }
+
     func stop() {
         userWantsTunnel = false
+        waitingFor = nil
         failureCount = 0
         nextRetry = nil
         lastError = nil
@@ -535,8 +714,9 @@ final class TunnelController {
     // to notice. Drop the process now so wake can start a clean one. This is
     // not the user switching the tunnel off, so their intent survives.
     func suspendForSleep() {
-        guard userWantsTunnel, isRunning || nextRetry != nil else { return }
+        guard userWantsTunnel, isRunning || nextRetry != nil || waitingFor != nil else { return }
         suspendedForSleep = true
+        waitingFor = nil
         cancelRetry()
         nextRetry = nil
         task?.terminate()

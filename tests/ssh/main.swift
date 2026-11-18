@@ -90,10 +90,164 @@ for badLink in [#"{"label":"Web","url":"http://localhost:80","remotePort":0}"#,
     } catch { precondition(error is PipeError) }
 }
 
+// A SOCKS tunnel reaches web links on other hosts through the bastion, which
+// only allows the destinations in its permitopen list.
+let socksTunnel = try Config.decode(Data("""
+{"tunnels":[{"name":"AI Gateway stage","tunnelAlias":"stage-bastion","probePort":1080,"socksPort":1080,"links":[
+  {"label":"Admin UI","url":"https://gateway.example/ui"},
+  {"label":"Plain","url":"http://gateway.example:8080/x"},
+  {"label":"Web","url":"http://localhost:7428"},
+  {"label":"Screen","url":"vnc://other.example"}]}]}
+""".utf8)).tunnels[0]
+precondition(socksTunnel.sshArguments.suffix(6) == ["-D", "127.0.0.1:1080", "-L", "7428:127.0.0.1:7428",
+                                                    "--", "stage-bastion"],
+             "The SOCKS port did not become a loopback -D: \(socksTunnel.sshArguments)")
+precondition(socksTunnel.proxiedTarget(of: socksTunnel.links[0]) == ProxiedTarget(host: "gateway.example", port: 443),
+             "An https link did not go through the SOCKS port")
+precondition(socksTunnel.proxiedTarget(of: socksTunnel.links[1]) == ProxiedTarget(host: "gateway.example", port: 8080),
+             "An explicit port on a proxied link was lost")
+precondition(socksTunnel.proxiedTarget(of: socksTunnel.links[2]) == nil, "A localhost link went through SOCKS")
+precondition(socksTunnel.proxiedTarget(of: socksTunnel.links[3]) == nil, "A non-web link was sent to a browser")
+precondition(forwarded.proxiedTarget(of: forwarded.links[2]) == nil,
+             "A tunnel without a SOCKS port proxied a link")
+precondition(!forwarded.sshArguments.contains("-D"), "A tunnel without a SOCKS port opened one")
+for badSocks in [#""socksPort":0,"links":[]"#,
+                 #""socksPort":7428,"links":[{"label":"Web","url":"http://localhost:7428"}]"#] {
+    do {
+        _ = try Config.decode(Data("""
+        {"tunnels":[{"name":"Example","tunnelAlias":"example","probePort":7428,\(badSocks)}]}
+        """.utf8))
+        fatalError("An unusable SOCKS port was accepted: \(badSocks)")
+    } catch { precondition(error is PipeError) }
+}
+
+// Browsers find the SOCKS ports through a PAC file. Only proxied hosts go
+// through a tunnel; every other site stays direct. A host behind two links is
+// listed once, and a tunnel without a SOCKS port adds nothing. Apple's PAC
+// engine skips "SOCKS5" and reads "SOCKS" as SOCKS5; Chrome and Firefox read
+// "SOCKS" as SOCKS4, which sends an address the bastion refuses. So each rule
+// lists both, SOCKS5 first.
+let expectedPAC = """
+// Served by PipeDesk from ssh.json.
+function FindProxyForURL(url, host) {
+  if (host == "gateway.example") return "SOCKS5 127.0.0.1:1080; SOCKS 127.0.0.1:1080";
+  return "DIRECT";
+}
+
+"""
+precondition(proxyAutoConfig(for: [socksTunnel, forwarded]) == expectedPAC,
+             "Wrong PAC file:\n\(proxyAutoConfig(for: [socksTunnel, forwarded]))")
+precondition(proxiedHostCount(in: [forwarded]) == 0 && proxiedHostCount(in: [socksTunnel, forwarded]) == 1,
+             "Miscounted the proxied hosts")
+let response = String(decoding: pacHTTPResponse(expectedPAC), as: UTF8.self)
+precondition(response.hasPrefix("HTTP/1.1 200 OK\r\n")
+             && response.contains("Content-Type: application/x-ns-proxy-autoconfig\r\n")
+             && response.contains("Content-Length: \(expectedPAC.utf8.count)\r\n")
+             && response.hasSuffix("\r\n\r\n" + expectedPAC), "Wrong PAC response:\n\(response)")
+
+// A SOCKS port must be free across every tunnel, and must not be the PAC port.
+for clash in [
+    #"[{"name":"A","tunnelAlias":"a","probePort":1080,"socksPort":1080,"links":[]},{"name":"B","tunnelAlias":"b","probePort":1080,"socksPort":1080,"links":[]}]"#,
+    #"[{"name":"A","tunnelAlias":"a","probePort":1080,"socksPort":1080,"links":[]},{"name":"B","tunnelAlias":"b","probePort":1080,"links":[{"label":"Web","url":"http://localhost:1080"}]}]"#,
+    #"[{"name":"A","tunnelAlias":"a","probePort":1079,"socksPort":1079,"links":[]}]"#] {
+    do {
+        _ = try Config.decode(Data(#"{"tunnels":\#(clash)}"#.utf8))
+        fatalError("A clashing SOCKS port was accepted: \(clash)")
+    } catch { precondition(error is PipeError) }
+}
+
+// Queued system proxy work runs only if no newer request came after it.
+let requests = LatestRequest()
+let olderRequest = requests.next()
+let newerRequest = requests.next()
+precondition(!requests.isLatest(olderRequest) && requests.isLatest(newerRequest), "An outdated request would run")
+DispatchQueue.concurrentPerform(iterations: 1000) { _ in _ = requests.next() }
+precondition(requests.next() == newerRequest + 1001, "Concurrent requests lost a count")
+
+// A tunnel can wait for another one, such as a jump that shares its connection.
+let ordered = try Config.decode(Data(#"{"tunnels":[{"name":"Office","tunnelAlias":"office","probePort":7427,"links":[]},{"name":"Avery","tunnelAlias":"avery","probePort":7428,"after":"Office","links":[]}]}"#.utf8))
+precondition(ordered.tunnels[1].after == "Office" && ordered.tunnels[0].after == nil, "Lost the after field")
+for broken in [
+    #"[{"name":"A","tunnelAlias":"a","probePort":1,"after":"Missing","links":[]}]"#,
+    #"[{"name":"A","tunnelAlias":"a","probePort":1,"after":"A","links":[]}]"#,
+    #"[{"name":"A","tunnelAlias":"a","probePort":1,"after":"B","links":[]},{"name":"B","tunnelAlias":"b","probePort":2,"after":"A","links":[]}]"#] {
+    do {
+        _ = try Config.decode(Data(#"{"tunnels":\#(broken)}"#.utf8))
+        fatalError("A broken after was accepted: \(broken)")
+    } catch { precondition(error is PipeError) }
+}
+var officeUp = false
+let waiting = TunnelController(config: ordered.tunnels[1])
+waiting.autoReconnect = false
+waiting.dependencyUp = { officeUp }
+waiting.start()
+precondition(!waiting.isRunning && waiting.waitingFor == "Office", "Started before the tunnel it waits for")
+precondition(tunnelStatusText(wantsConnection: true, state: .down, lastError: nil, retryInSeconds: nil,
+                              silentLinks: [], servicesChecked: false, waitingFor: "Office") == "Waiting for Office",
+             "Waiting status not shown")
+waiting.startIfDependencyUp()
+precondition(waiting.waitingFor == "Office", "Left waiting while the other tunnel is down")
+waiting.stop()
+precondition(waiting.waitingFor == nil, "A stopped tunnel still waits")
+officeUp = true
+waiting.startIfDependencyUp()
+precondition(!waiting.isRunning, "A stopped tunnel started when the other came up")
+
+// A PipeDesk killed outright leaves its ssh children under launchd, holding
+// their ports. The next launch stops exactly those: parent 1 and the same
+// command line PipeDesk builds. A user's own ssh, or one still owned by a
+// running parent, is left alone.
+let orphanLine = ([sshPath] + socksTunnel.sshArguments).joined(separator: " ")
+let processList = """
+  501     1 \(orphanLine)
+  502   400 \(orphanLine)
+  503     1 /usr/bin/ssh -N stage-bastion
+  504     1 /usr/bin/ssh \(socksTunnel.sshArguments.joined(separator: " ")) extra
+"""
+precondition(orphanedTunnelPIDs(processList: processList, tunnels: [socksTunnel, forwarded]) == [501],
+             "Wrong orphans: \(orphanedTunnelPIDs(processList: processList, tunnels: [socksTunnel, forwarded]))")
+
+// The macOS automatic proxy setting, one network service at a time.
+let ours = "http://127.0.0.1:1079/proxy.pac"
+precondition(parseAutoProxy(service: "Wi-Fi", output: "URL: \(ours)\nEnabled: Yes\n")
+             == AutoProxySetting(service: "Wi-Fi", url: ours, enabled: true), "Misread an enabled setting")
+precondition(parseAutoProxy(service: "Wi-Fi", output: "URL: (null)\nEnabled: No\n")
+             == AutoProxySetting(service: "Wi-Fi", url: nil, enabled: false), "Misread an empty setting")
+precondition(parseServiceList("An asterisk (*) denotes that a network service is disabled.\nWi-Fi\n*Thunderbolt Bridge\n")
+             == ["Wi-Fi", "Thunderbolt Bridge"], "Misread the service list")
+// A service with someone else's PAC is left alone. One already on ours needs no change.
+let current = [AutoProxySetting(service: "Wi-Fi", url: nil, enabled: false),
+               AutoProxySetting(service: "LAN", url: "http://corp/proxy.pac", enabled: true),
+               AutoProxySetting(service: "Dock", url: ours, enabled: true),
+               AutoProxySetting(service: "Bridge", url: "http://old/proxy.pac", enabled: false)]
+precondition(planAutoProxy(current, ours: ours) == AutoProxyPlan(enable: ["Wi-Fi", "Bridge"], skipped: ["LAN"]),
+             "Wrong services to change: \(planAutoProxy(current, ours: ours))")
+// Restore turns off only what PipeDesk turned on and still holds.
+let afterward = [AutoProxySetting(service: "Wi-Fi", url: ours, enabled: true),
+                 AutoProxySetting(service: "Bridge", url: "http://someone/else.pac", enabled: true),
+                 AutoProxySetting(service: "LAN", url: ours, enabled: true)]
+precondition(servicesToRestore(recorded: ["Wi-Fi", "Bridge", "Gone"], current: afterward, ours: ours) == ["Wi-Fi"],
+             "Restore touched a service PipeDesk no longer owns")
+// The record keeps each service's own PAC URL, so restore can put it back.
+// A service recorded twice keeps the URL from before PipeDesk first changed it.
+let merged = mergeRecord([ChangedService(service: "Bridge", previousURL: "http://old/proxy.pac")],
+                         adding: [ChangedService(service: "Bridge", previousURL: ours),
+                                  ChangedService(service: "Wi-Fi", previousURL: nil)])
+precondition(merged == [ChangedService(service: "Bridge", previousURL: "http://old/proxy.pac"),
+                        ChangedService(service: "Wi-Fi", previousURL: nil)], "Lost a previous URL: \(merged)")
+let recordData = try JSONEncoder().encode(merged)
+let readBack = try decodeRecord(recordData)
+precondition(readBack == merged, "The record did not read back")
+// Records written before URLs were kept are a plain list of names.
+let olderRecord = try decodeRecord(Data(#"["Wi-Fi","Pixel 6"]"#.utf8))
+precondition(olderRecord
+             == [ChangedService(service: "Wi-Fi", previousURL: nil), ChangedService(service: "Pixel 6", previousURL: nil)],
+             "An older record no longer reads")
+
 // A config edit restarts only the tunnels it changed.
 func tunnel(_ name: String, port: UInt16) -> TunnelConfig {
     TunnelConfig(name: name, tunnelAlias: name.lowercased(), shellAlias: nil, probePort: port,
-                 links: [], controlPath: nil, restartAgent: nil)
+                 links: [], controlPath: nil, restartAgent: nil, socksPort: nil, after: nil)
 }
 let before = [tunnel("Office", port: 7427), tunnel("Avery", port: 7428), tunnel("Spark", port: 8766)]
 let after = [tunnel("Spark", port: 8766), tunnel("Office", port: 9000), tunnel("Avery", port: 7428)]
@@ -209,6 +363,46 @@ precondition(probeLocalService(port: refusedPort, wait: 1) == .notAnswering,
              "A forward whose remote refused read as answering")
 precondition(probeLocalService(port: testPort, wait: 1) == .notAnswering,
              "A closed port read as answering")
+
+// The SOCKS check, against what OpenSSH does: it replies only after the
+// bastion opened the channel, and closes without a reply when permitopen
+// refuses the destination.
+func readExactly(_ connection: Int32, _ count: Int) -> [UInt8] {
+    var bytes = [UInt8](repeating: 0, count: count)
+    var filled = 0
+    while filled < count {
+        let got = bytes.withUnsafeMutableBytes { recv(connection, $0.baseAddress! + filled, count - filled, 0) }
+        guard got > 0 else { return Array(bytes[..<filled]) }
+        filled += got
+    }
+    return bytes
+}
+let expectedRequest: [UInt8] = [5, 1, 0, 3, 15] + Array("gateway.example".utf8) + [1, 187]
+func socksServer(reply: [UInt8]?, holdOpen: Bool) -> UInt16 {
+    serve { connection in
+        precondition(readExactly(connection, 3) == [5, 1, 0], "Wrong SOCKS greeting")
+        _ = [UInt8]([5, 0]).withUnsafeBytes { write(connection, $0.baseAddress, 2) }
+        precondition(readExactly(connection, expectedRequest.count) == expectedRequest, "Wrong SOCKS request")
+        if let reply { _ = reply.withUnsafeBytes { write(connection, $0.baseAddress, reply.count) } }
+        if holdOpen { sleep(3) }
+        close(connection)
+    }
+}
+let success: [UInt8] = [5, 0, 0, 1, 0, 0, 0, 0, 1, 187]
+precondition(probeThroughSOCKS(socksPort: socksServer(reply: success, holdOpen: true),
+                               host: "gateway.example", port: 443, wait: 1) == .answering,
+             "A reachable destination read as down")
+precondition(probeThroughSOCKS(socksPort: socksServer(reply: nil, holdOpen: false),
+                               host: "gateway.example", port: 443, wait: 1) == .notAnswering,
+             "A destination the bastion refused read as answering")
+precondition(probeThroughSOCKS(socksPort: socksServer(reply: success, holdOpen: false),
+                               host: "gateway.example", port: 443, wait: 1) == .notAnswering,
+             "A destination that closed at once read as answering")
+precondition(probeThroughSOCKS(socksPort: socksServer(reply: [5, 2, 0, 1, 0, 0, 0, 0, 0, 0], holdOpen: true),
+                               host: "gateway.example", port: 443, wait: 1) == .notAnswering,
+             "A SOCKS failure reply read as answering")
+precondition(probeThroughSOCKS(socksPort: testPort, host: "gateway.example", port: 443, wait: 1) == .notAnswering,
+             "A closed SOCKS port read as answering")
 
 print("SSH import and socket cleanup checks passed")
 

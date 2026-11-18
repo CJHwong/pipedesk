@@ -165,6 +165,7 @@ Imported `restartAgent` labels restart their dependencies during import and appl
 Before starting SSH tunnels, PipeDesk checks user LaunchAgents for duplicate direct `ssh -N` commands with the same alias.
 It disables and unloads those duplicate jobs. Their property list files remain available for recovery.
 The disabled jobs stay disabled across login. PipeDesk becomes the only owner of those tunnels.
+If PipeDesk was killed outright, its `ssh` processes keep running and hold their ports. The next launch stops the ones whose command line matches a configured tunnel exactly.
 It preserves jobs for other aliases, shell sessions, alternate SSH configurations, and underlying transport services.
 Migration accepts only the legacy `BatchMode`, `ExitOnForwardFailure`, `ServerAliveInterval`, and `ServerAliveCountMax` options.
 If migration fails, PipeDesk shows an error and leaves its SSH tunnels stopped.
@@ -198,6 +199,45 @@ A `LocalForward` that repeats one of these is harmless, because ssh skips the du
 New installations have no personal aliases, ports, or service links.
 Invalid configuration does not start example connections.
 
+### One connection to a jump host
+
+Several ssh sessions to one host can share a single connection. In `~/.ssh/config`, give the forward alias `ControlMaster yes` and a `ControlPath`, and set `controlPath` on its tunnel to the same path. Give the other aliases for that host `ControlMaster no` and the same `ControlPath`. They ride on the tunnel's connection while it is up, and connect on their own while it is down.
+
+A tunnel that jumps through that host must start after it, or its jump opens a connection of its own. Set `after` to the jump tunnel's name:
+
+```json
+{"name": "Inner server", "tunnelAlias": "inner-forward", "probePort": 8081, "after": "Example server", "links": []}
+```
+
+PipeDesk starts that tunnel only when the named tunnel is up, and shows "Waiting for" the name until then. When the shared connection drops, every session on it drops too, and each tunnel reconnects in that order. The named tunnel cannot have an `after` of its own.
+
+### Web apps behind a bastion
+
+Some bastions allow forwards only to listed hosts, and some web apps redirect to their own host name. One `-L` forward cannot serve that app. Set `socksPort` on the tunnel instead:
+
+```json
+{
+  "name": "Internal admin",
+  "tunnelAlias": "example-bastion",
+  "probePort": 1080,
+  "socksPort": 1080,
+  "links": [{"label": "Admin UI", "url": "https://admin.internal.example/ui"}]
+}
+```
+
+PipeDesk adds `-D 127.0.0.1:1080` to the tunnel. Each `http` or `https` link to another host then goes through that port:
+
+1. Turn on **System Proxy for SOCKS Links** under **Settings**. It is off by default, because it changes a system setting.
+2. PipeDesk serves a proxy auto-configuration (PAC) file at `http://127.0.0.1:1079/proxy.pac`. It sends each of those hosts to its tunnel's SOCKS port and every other site direct.
+3. PipeDesk points the macOS automatic proxy setting of each network service at that file. Safari, Chrome, Edge, Arc, and Firefox-based browsers follow it by default, so clicking the link opens it in your default browser.
+4. The link's dot checks the host through the SOCKS port. It turns green only when the bastion opens the connection and the host keeps it open.
+
+PipeDesk leaves a network service alone when it already uses another PAC file, and says so under the setting. It records the services it changed, and any PAC URL each one held before, in `~/.config/pipedesk/system-proxy.json`. It turns them off again when you turn the setting off, when no tunnel has a `socksPort`, and when PipeDesk quits. After a crash, the next launch restores them from that record. PipeDesk sets them only while its own server holds port 1079. If another program holds the port, PipeDesk leaves the setting off, shows the error under the setting, and tries again every 30 seconds. While PipeDesk is not running, browsers reach every other site directly.
+
+Command-line tools such as `curl` ignore the macOS proxy setting. Name the SOCKS port for them: `curl --socks5-hostname 127.0.0.1:1080 https://admin.internal.example/ui`. A browser set to "No proxy" or a manual proxy also ignores the setting.
+
+Give each tunnel a different `socksPort`. A link must not use the same local port.
+
 ## Files and identity
 
 | Location | Purpose |
@@ -205,6 +245,7 @@ Invalid configuration does not start example connections.
 | `~/.config/pipedesk/profiles.json` | Dumbpipe profiles and remote tickets. |
 | `~/.config/pipedesk/keys/` | Private identity for each Dumbpipe profile. |
 | `~/.config/pipedesk/ssh.json` | Imported SSH profiles. |
+| `~/.config/pipedesk/system-proxy.json` | Network services whose automatic proxy setting PipeDesk changed. |
 | `~/Library/Logs/pipedesk.log` | Process lifecycle and SSH diagnostics. |
 
 Back up private identities securely. Losing an identity requires a new ticket.

@@ -7,7 +7,7 @@ swiftc -warnings-as-errors src/PipeCore.swift tests/main.swift -o .build/tests/p
 swiftc -warnings-as-errors src/PipeCore.swift src/PatchpipeExport.swift \
     tests/export/main.swift -o .build/tests/export
 .build/tests/export
-swiftc -warnings-as-errors src/PipeCore.swift src/SSHController.swift src/LegacyTunnelAgent.swift \
+swiftc -warnings-as-errors src/PipeCore.swift src/SSHController.swift src/SystemProxy.swift src/LegacyTunnelAgent.swift \
     tests/ssh/main.swift -o .build/tests/ssh
 .build/tests/ssh
 ./build.sh

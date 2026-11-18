@@ -63,6 +63,13 @@ final class TunnelSwitch: NSView {
     override func accessibilityValue() -> Any? { isOn }
 }
 
+// One check of one service behind a tunnel, keyed like TunnelRow.health.
+struct ServiceCheck {
+    let key: String
+    let label: String
+    let run: () -> ServiceHealth
+}
+
 // One tunnel's controller plus the views that show it.
 final class TunnelRow {
     let controller: TunnelController
@@ -81,19 +88,27 @@ final class TunnelRow {
 
     var name: String { controller.config.name }
 
-    // The links whose service can be checked through this tunnel. With no
-    // link, the probe port stands in, so a bare tunnel still gets a check.
-    var checkedPorts: [(key: String, label: String, port: UInt16)] {
-        let links = controller.config.links.compactMap { link in
-            link.localPort.map { (key: link.url, label: link.label, port: $0) }
+    // The links whose service can be checked through this tunnel: a local
+    // forward, or a host behind the SOCKS port. With no such link, the probe
+    // port stands in, so a bare tunnel still gets a check.
+    var checks: [ServiceCheck] {
+        let config = controller.config
+        let links = config.links.compactMap { link -> ServiceCheck? in
+            if let port = link.localPort {
+                return ServiceCheck(key: link.url, label: link.label) { probeLocalService(port: port) }
+            }
+            guard let target = config.proxiedTarget(of: link), let socks = config.socksPort else { return nil }
+            return ServiceCheck(key: link.url, label: link.label) {
+                probeThroughSOCKS(socksPort: socks, host: target.host, port: target.port)
+            }
         }
         if !links.isEmpty { return links }
-        let port = controller.config.probePort
-        return [(key: "port:\(port)", label: "port \(port)", port: port)]
+        let port = config.probePort
+        return [ServiceCheck(key: "port:\(port)", label: "port \(port)") { probeLocalService(port: port) }]
     }
 
-    var servicesChecked: Bool { checkedPorts.allSatisfy { health[$0.key] != nil } }
-    var silentLinks: [String] { checkedPorts.filter { health[$0.key] == .notAnswering }.map(\.label) }
+    var servicesChecked: Bool { checks.allSatisfy { health[$0.key] != nil } }
+    var silentLinks: [String] { checks.filter { health[$0.key] == .notAnswering }.map(\.label) }
 }
 
 // MARK: - App
@@ -111,13 +126,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var configStamp: Date?
     private let pathMonitor = NWPathMonitor()
     private var pathSignature: String?
+    private let pacServer = PACServer()
+    // networksetup calls take a moment each, so they run off the main thread,
+    // one at a time, in the order they were asked for.
+    private let systemProxyQueue = DispatchQueue(label: "app.pipedesk.system-proxy")
+    private let systemProxyRequests = LatestRequest()
+    private var systemProxyNote: String?
+    // False in a second copy that lost the instance lock. That copy must not
+    // undo the system setting the running copy owns.
+    private var ownsInstance = false
+    private static let systemProxyKey = "systemProxyForSOCKSLinks"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard acquireInstanceLock() else { NSApp.terminate(nil); return }
+        ownsInstance = true
         Log.write("app launched")
         trapSignals()
         observePowerEvents()
         observeNetworkChanges()
+        restoreSystemProxyLeftOver()
+        stopOrphanedTunnels(for: Config.load().config.tunnels)
+        pacServer.onFailure = { [weak self] message in
+            DispatchQueue.main.async { self?.pacServerFailed(message) }
+        }
         loadPipes()
         loadConfigAndStart(restartingAgents: true)
         if rows.isEmpty && pipes.isEmpty { showSetup() }
@@ -143,8 +174,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        guard ownsInstance else { return }
         rows.forEach { $0.controller.stop() }
         pipes.forEach { $0.shutdown() }
+        // Browsers fall back to direct for other sites when the PAC is gone,
+        // but the setting would still name a server that no longer answers.
+        pacServer.stop()
+        // Newer than anything queued, so queued work skips and quit waits only
+        // for a networksetup call already running.
+        _ = systemProxyRequests.next()
+        systemProxyQueue.sync { restoreSystemProxy() }
     }
 
     // Refresh on open so no switch can show a stale position, and check the
@@ -172,15 +211,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             buildMenu()
             return
         }
+        syncSystemProxy(config.tunnels)
         rows = config.tunnels.map(makeRow)
         if restartingAgents { restartAgents(from: config, excluding: retiredLabels) }
         buildMenu()
         startTunnelsWhenPipesReady()
     }
 
+    // MARK: System proxy
+
+    // With the setting on and at least one proxied link, serve the PAC and
+    // point every network service at it. Otherwise undo what PipeDesk changed.
+    private func syncSystemProxy(_ tunnels: [TunnelConfig]) {
+        let wanted = UserDefaults.standard.bool(forKey: Self.systemProxyKey) && proxiedHostCount(in: tunnels) > 0
+        let request = systemProxyRequests.next()
+        guard wanted else {
+            pacServer.stop()
+            systemProxyQueue.async { [weak self] in
+                guard let self, self.systemProxyRequests.isLatest(request) else { return }
+                self.restoreSystemProxy()
+                DispatchQueue.main.async { self.systemProxyNote = nil; self.refresh() }
+            }
+            return
+        }
+        // The setting follows the listener: only a port PipeDesk holds may be named.
+        pacServer.serve(proxyAutoConfig(for: tunnels)) { [weak self] in
+            self?.systemProxyQueue.async {
+                guard let self, self.systemProxyRequests.isLatest(request) else { return }
+                self.applySystemProxy()
+            }
+        }
+    }
+
+    private func applySystemProxy() {
+        var note: String?
+        do {
+            let skipped = try SystemProxy.standard.apply()
+            if !skipped.isEmpty { note = "Skipped \(skipped.joined(separator: ", ")): uses another proxy file" }
+        } catch {
+            note = "System proxy not set: \(error.localizedDescription)"
+            Log.write(note ?? "")
+        }
+        DispatchQueue.main.async { [weak self] in self?.systemProxyNote = note; self?.refresh() }
+    }
+
+    // The listener is gone, so the setting must not keep naming its port.
+    // Try again later: the port may free up, or the network may come back.
+    private func pacServerFailed(_ message: String) {
+        systemProxyNote = message
+        refresh()
+        let request = systemProxyRequests.next()
+        systemProxyQueue.async { [weak self] in
+            guard let self, self.systemProxyRequests.isLatest(request) else { return }
+            self.restoreSystemProxy()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            guard let self else { return }
+            self.syncSystemProxy(self.rows.map(\.controller.config))
+        }
+    }
+
+    private func restoreSystemProxy() {
+        do { try SystemProxy.standard.restore() } catch {
+            Log.write("system proxy not restored: \(error.localizedDescription)")
+        }
+    }
+
+    // A crash skips applicationWillTerminate, so the record of what it changed
+    // survives. Undo that first; the config load sets it again if wanted.
+    private func restoreSystemProxyLeftOver() {
+        systemProxyQueue.sync { restoreSystemProxy() }
+    }
+
+    @objc private func toggleSystemProxy() {
+        let turnOn = !UserDefaults.standard.bool(forKey: Self.systemProxyKey)
+        UserDefaults.standard.set(turnOn, forKey: Self.systemProxyKey)
+        Log.write("system proxy for SOCKS links \(turnOn ? "on" : "off")")
+        syncSystemProxy(rows.map(\.controller.config))
+    }
+
     private func makeRow(_ config: TunnelConfig) -> TunnelRow {
         let row = TunnelRow(config: config)
         row.controller.onStateChange = { [weak self] in self?.refresh() }
+        if let after = config.after {
+            row.controller.dependencyUp = { [weak self] in
+                self?.rows.first { $0.controller.config.name == after }?.controller.state == .up
+            }
+        }
         return row
     }
 
@@ -218,6 +335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         configError = nil
+        syncSystemProxy(config.tunnels)
         let matches = matchTunnels(current: rows.map(\.controller.config), next: config.tunnels)
         let kept = Set(matches.compactMap { $0 })
         let removed = rows.indices.filter { !kept.contains($0) }.map { rows[$0] }
@@ -257,9 +375,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func check(_ row: TunnelRow) {
         row.checking = true
-        let targets = row.checkedPorts
+        let checks = row.checks
         DispatchQueue.global(qos: .utility).async { [weak self, weak row] in
-            let results = targets.map { ($0.key, probeLocalService(port: $0.port)) }
+            let results = checks.map { ($0.key, $0.run()) }
             DispatchQueue.main.async {
                 guard let row else { return }
                 row.checking = false
@@ -296,6 +414,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defer { pathSignature = signature }
         guard let previous = pathSignature, previous != signature, usable else { return }
         Log.write("network changed")
+        // A new interface, such as a dock's Ethernet, needs the setting too.
+        syncSystemProxy(rows.map(\.controller.config))
         rows.forEach { $0.controller.retryNowIfWaiting() }
         rows.forEach { $0.health = [:] }
         checkServices()
@@ -388,6 +508,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Log.write("system woke")
             self?.rows.forEach { $0.controller.resumeAfterWake() }
             self?.pipes.forEach { $0.resume() }
+            // The PAC listener may not survive sleep. A live one answers at
+            // once; a dead one starts again before the setting names it.
+            if let self { self.syncSystemProxy(self.rows.map(\.controller.config)) }
             self?.refresh()
         }
     }
@@ -417,7 +540,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             row.linkRows = []
             for link in row.controller.config.links {
                 let view = MenuRowView(label: link.label, symbol: link.symbol, detail: link.detail,
-                                       dot: linkDot(link, health: row.health[link.url]))
+                                       dot: linkDot(link, in: row))
                 let item = viewItem(view, title: link.label, selector: #selector(openLink(_:)))
                 item.representedObject = link.url
                 row.linkRows.append((link, view))
@@ -464,6 +587,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // right of every row.
     private func addSettings(to menu: NSMenu) {
         menu.addItem(heading("Settings"))
+        let systemProxy = NSMenuItem(title: "System Proxy for SOCKS Links",
+                                     action: #selector(toggleSystemProxy), keyEquivalent: "")
+        systemProxy.tag = 120
+        systemProxy.offStateImage = NSImage(size: NSSize(width: 12, height: 12))
+        menu.addItem(systemProxy)
+        menu.addItem(note("", tag: 121))
         menu.addItem(NSMenuItem(title: "Edit SSH Configuration...", action: #selector(editConfig), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Import SSH Configuration...", action: #selector(importSSH), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Choose Dumbpipe Executable...", action: #selector(chooseDumbpipe), keyEquivalent: ""))
@@ -499,10 +628,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // A link's dot is green when its service answered the last check, grey
-    // when it did not or has not been checked. A link to another host has no dot.
-    private func linkDot(_ link: Link, health: ServiceHealth?) -> NSColor? {
-        guard link.localPort != nil else { return nil }
-        return health == .answering ? .systemGreen : .tertiaryLabelColor
+    // when it did not or has not been checked. A link to another host has no
+    // dot, unless it goes through the tunnel's SOCKS port.
+    private func linkDot(_ link: Link, in row: TunnelRow) -> NSColor? {
+        guard link.localPort != nil || row.controller.config.proxiedTarget(of: link) != nil else { return nil }
+        return row.health[link.url] == .answering ? .systemGreen : .tertiaryLabelColor
     }
 
     private func viewItem(_ view: MenuRowView, title: String, selector: Selector) -> NSMenuItem {
@@ -561,7 +691,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             row.statusLabel.toolTip = row.controller.lastError
             row.toggleSwitch.isOn = row.controller.wantsConnection
             for (link, view) in row.linkRows {
-                view.dot = linkDot(link, health: row.health[link.url])
+                view.dot = linkDot(link, in: row)
             }
         }
 
@@ -576,12 +706,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.image?.accessibilityDescription = description
         statusItem.button?.toolTip = description
         statusItem.menu?.item(withTag: 110)?.title = summary
+        statusItem.menu?.item(withTag: 120)?.state =
+            UserDefaults.standard.bool(forKey: Self.systemProxyKey) ? .on : .off
+        if let proxyNote = statusItem.menu?.item(withTag: 121) {
+            proxyNote.title = systemProxyNote ?? ""
+            proxyNote.isHidden = systemProxyNote == nil
+        }
         updatePipeMenu()
 
         statusItem.menu?.item(withTitle: "Reconnect Automatically")?.state =
             (rows.allSatisfy { $0.controller.autoReconnect } && pipes.allSatisfy { $0.autoReconnect }) ? .on : .off
         statusItem.menu?.item(withTitle: "Open at Login")?.state =
             SMAppService.mainApp.status == .enabled ? .on : .off
+        // Last, because a start calls refresh again.
+        rows.forEach { $0.controller.startIfDependencyUp() }
     }
 
     // Old answers describe a tunnel that no longer exists, so they go when it
@@ -600,7 +738,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let retry = row.controller.nextRetry.map { max(0, Int($0.timeIntervalSinceNow.rounded())) }
         return tunnelStatusText(wantsConnection: row.controller.wantsConnection, state: state,
                                 lastError: row.controller.lastError, retryInSeconds: retry,
-                                silentLinks: row.silentLinks, servicesChecked: row.servicesChecked)
+                                silentLinks: row.silentLinks, servicesChecked: row.servicesChecked,
+                                waitingFor: row.controller.waitingFor)
     }
 
     private func statusColor(for row: TunnelRow, state: TunnelState) -> NSColor {
@@ -913,6 +1052,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh()
     }
 
+    // A link behind a SOCKS port opens here too. The browser reaches it through
+    // the PAC file PipeDesk writes, so every link opens the same way.
     @objc private func openLink(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
               let url = URL(string: raw) else { return }

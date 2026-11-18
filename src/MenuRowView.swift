@@ -46,7 +46,7 @@ final class MenuRowView: NSView {
             drawIcon(symbol, color: primary)
             textStart = MenuGrid.iconTextStart
         }
-        drawText(label, font: MenuGrid.labelFont, color: primary, left: textStart)
+        let labelEnd = textStart + drawText(label, font: MenuGrid.labelFont, color: primary, left: textStart)
 
         var right = MenuGrid.rightEdge
         if let dot {
@@ -56,7 +56,22 @@ final class MenuRowView: NSView {
                                         width: diameter, height: diameter)).fill()
             right -= diameter + 6
         }
-        drawText(detail, font: MenuGrid.detailFont, color: secondary, right: right)
+        drawDetail(color: secondary, from: labelEnd + 8, to: right)
+    }
+
+    // The detail gets only the space the label leaves. A long one loses its
+    // end: a host name says which service it is at the start, and the domain
+    // after it is usually the same on every row.
+    private func drawDetail(color: NSColor, from left: CGFloat, to right: CGFloat) {
+        guard right > left else { return }
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .right
+        paragraph.lineBreakMode = .byTruncatingTail
+        let text = NSAttributedString(string: detail, attributes: [
+            .font: MenuGrid.detailFont, .foregroundColor: color, .paragraphStyle: paragraph])
+        let height = text.size().height
+        text.draw(with: NSRect(x: left, y: (bounds.height - height) / 2, width: right - left, height: height),
+                  options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
     }
 
     private func drawIcon(_ symbol: String, color: NSColor) {
@@ -70,12 +85,12 @@ final class MenuRowView: NSView {
                               width: size.width, height: size.height))
     }
 
-    private func drawText(_ string: String, font: NSFont, color: NSColor,
-                          left: CGFloat? = nil, right: CGFloat? = nil) {
+    // Draws a label from its left edge and returns its width.
+    private func drawText(_ string: String, font: NSFont, color: NSColor, left: CGFloat) -> CGFloat {
         let text = NSAttributedString(string: string, attributes: [.font: font, .foregroundColor: color])
         let size = text.size()
-        let x = left ?? ((right ?? 0) - size.width)
-        text.draw(at: NSPoint(x: x, y: (bounds.height - size.height) / 2))
+        text.draw(at: NSPoint(x: left, y: (bounds.height - size.height) / 2))
+        return size.width
     }
 
     override func mouseUp(with event: NSEvent) {
